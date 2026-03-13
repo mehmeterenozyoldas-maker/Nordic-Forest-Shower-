@@ -1,0 +1,7 @@
+{
+  "name": "Realistic Nature Point Cloud",
+  "description": "An interactive WebGL point cloud representing a natural environment with realistic lighting, fog, and wind interactions.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
