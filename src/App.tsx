@@ -3,9 +3,11 @@ import {
   Circle,
   Eye,
   EyeOff,
+  Glasses,
   Hand,
   Radio,
   RotateCcw,
+  Sprout,
   Square,
   Volume2,
   VolumeX,
@@ -17,6 +19,7 @@ import { SimulationController } from './engine/SimulationController';
 import {
   InteractionContext,
   InteractionMode,
+  PlantSpecies,
   SimulationHUDState,
 } from './types/simulation';
 
@@ -36,11 +39,17 @@ const INTERACTION_MODES: InteractionMode[] = [
   'Seismic Ripple',
 ];
 
+const PLANT_SPECIES: PlantSpecies[] = ['Oak', 'Pine', 'Bush'];
+
 const INITIAL_HUD: SimulationHUDState = {
+  mode: 'explore',
+  plantType: 'Oak',
+  plantedCount: 0,
   chapterIndex: 0,
   interactionMode: 'Wind Gust',
   interactionContext: 'All',
   activeSource: 'pointer',
+  secondaryCursorActive: false,
   attractMode: false,
   audioEnabled: false,
   audioMuted: false,
@@ -48,7 +57,17 @@ const INITIAL_HUD: SimulationHUDState = {
   cursorSpeed: 0,
   windStrength: 2.0,
   interactionRadius: 5.5,
-  handTracking: { status: 'idle', handDetected: false, pinchStrength: 0, error: null },
+  handTracking: {
+    status: 'idle',
+    handDetected: false,
+    handsCount: 0,
+    pinchStrength: 0,
+    secondaryPinchStrength: 0,
+    twoHandZoomActive: false,
+    chapterGestureProgress: 0,
+    gestureHint: null,
+    error: null,
+  },
   hardware: {
     bleStatus: 'disconnected',
     bleDeviceName: null,
@@ -72,6 +91,7 @@ const INITIAL_HUD: SimulationHUDState = {
     error: null,
   },
   recording: { isRecording: false, elapsedSec: 0, error: null },
+  webxr: { supported: false, active: false, controllersConnected: 0, error: null },
   webglLost: false,
   isSoftwareGl: false,
 };
@@ -91,6 +111,7 @@ export default function App() {
   const [hud, setHud] = useState<SimulationHUDState>(INITIAL_HUD);
   const [inputsOpen, setInputsOpen] = useState(false);
   const [hudCollapsed, setHudCollapsed] = useState(false);
+  const [placardVisible, setPlacardVisible] = useState(true);
 
   useEffect(() => {
     const mount = canvasMountRef.current;
@@ -113,6 +134,13 @@ export default function App() {
     );
   }, [hud.handTracking.status]);
 
+  // Kinetic museum placard entrance whenever chapter changes
+  useEffect(() => {
+    setPlacardVisible(false);
+    const id = window.setTimeout(() => setPlacardVisible(true), 60);
+    return () => window.clearTimeout(id);
+  }, [hud.chapterIndex]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -121,11 +149,13 @@ export default function App() {
         setInputsOpen((prev) => !prev);
       } else if (k === 'u' || k === 'h') {
         setHudCollapsed((prev) => !prev);
+      } else if (k === 'p') {
+        controllerRef.current?.setMode(hud.mode === 'explore' ? 'plant' : 'explore');
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [hud.mode]);
 
   const currentChapter = EXHIBITION_CHAPTERS[hud.chapterIndex] ?? EXHIBITION_CHAPTERS[0];
   const anyHardwareConnected =
@@ -166,15 +196,15 @@ export default function App() {
         {/* Top Bar: Clean 2-Edge Museum Header */}
         <header className="flex items-start justify-between gap-6">
           <div
-            className={`transition-opacity duration-300 ${
-              hudCollapsed ? 'opacity-0' : 'opacity-100'
+            className={`transition-all duration-500 ease-out ${
+              hudCollapsed ? '-translate-y-2 opacity-0' : 'translate-y-0 opacity-100'
             }`}
           >
             <h1 className="font-display text-3xl font-normal tracking-[0.14em] text-stone-50 sm:text-4xl">
               Nordic Simulation
             </h1>
             <p className="mt-1 max-w-md text-xs leading-relaxed text-stone-400">
-              Interactive particle landscape · Persistent fluid wakes · Atmospheric light
+              Interactive particle landscape · Persistent fluid wakes · Spatial WebXR
             </p>
           </div>
 
@@ -212,6 +242,29 @@ export default function App() {
                   : hud.handTracking.status === 'active'
                     ? 'Stop Hand Tracking'
                     : 'Hand Tracking'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={!hud.webxr.supported}
+              onClick={() => void controllerRef.current?.toggleVR()}
+              title={
+                hud.webxr.supported
+                  ? 'Enter immersive WebXR VR installation'
+                  : 'WebXR headset not detected in this browser'
+              }
+              className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium whitespace-nowrap transition-colors ${
+                hud.webxr.active
+                  ? 'border-cyan-300/60 bg-cyan-950/90 text-cyan-100'
+                  : hud.webxr.supported
+                    ? 'border-white/15 bg-stone-950/90 text-stone-200 hover:border-cyan-300/40 hover:text-white'
+                    : 'cursor-not-allowed border-white/10 bg-stone-950/60 text-stone-500'
+              }`}
+            >
+              <Glasses className="h-3.5 w-3.5" />
+              <span>
+                {hud.webxr.active ? 'Exit VR' : hud.webxr.supported ? 'Enter VR' : 'VR Unavailable'}
               </span>
             </button>
 
@@ -283,11 +336,22 @@ export default function App() {
         {/* Bottom Area: Curatorial Placard + Unified Control Dock */}
         {!hudCollapsed && (
           <div className="flex flex-col gap-4">
-            {/* Curatorial Info Placard (Clean Hairline Perimeter — No Left Accent Bar) */}
-            <div className="max-w-md rounded-lg border border-white/15 bg-stone-950/90 p-5">
-              <p className="text-[11px] uppercase tracking-[0.18em] text-stone-400">
-                {currentChapter.accessionCode}
-              </p>
+            {/* Kinetic Curatorial Info Placard (Clean Hairline Perimeter — No Left Accent Bar) */}
+            <div
+              className={`max-w-md rounded-lg border border-white/15 bg-stone-950/90 p-5 transition-all duration-500 ease-out ${
+                placardVisible ? 'translate-y-0 opacity-100' : 'translate-y-3 opacity-0'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[11px] uppercase tracking-[0.18em] text-stone-400">
+                  {currentChapter.accessionCode}
+                </p>
+                {hud.plantedCount > 0 && (
+                  <span className="font-mono-tabular text-[11px] text-emerald-300">
+                    +{hud.plantedCount} Planted
+                  </span>
+                )}
+              </div>
               <h2 className="font-display mt-1 text-2xl font-semibold text-stone-50">
                 {currentChapter.title}
               </h2>
@@ -297,7 +361,7 @@ export default function App() {
             </div>
 
             {/* Unified Bottom Control Dock */}
-            <div className="pointer-events-auto mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-3 rounded-lg border border-white/15 bg-stone-950/92 px-4 py-3">
+            <div className="pointer-events-auto mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 rounded-lg border border-white/15 bg-stone-950/92 px-4 py-3">
               {/* Chapter Navigation */}
               <div className="flex flex-wrap items-center gap-1.5">
                 {EXHIBITION_CHAPTERS.map((ch, idx) => (
@@ -316,43 +380,95 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Context Target Filter */}
+              {/* Explore vs Plant Mode Switch */}
               <div className="flex items-center gap-1.5">
-                <span className="text-[11px] text-stone-400 whitespace-nowrap">Target</span>
                 <div className="flex items-center gap-1 rounded border border-white/10 bg-black/60 p-0.5">
-                  {INTERACTION_CONTEXTS.map((ctx) => (
-                    <button
-                      key={ctx}
-                      type="button"
-                      onClick={() => controllerRef.current?.setInteractionContext(ctx)}
-                      className={`rounded px-2.5 py-1 text-xs whitespace-nowrap transition-colors ${
-                        hud.interactionContext === ctx
-                          ? 'bg-cyan-300 font-semibold text-stone-950'
-                          : 'text-stone-300 hover:text-white'
-                      }`}
-                    >
-                      {ctx.replace(' Only', '')}
-                    </button>
-                  ))}
+                  <button
+                    type="button"
+                    onClick={() => controllerRef.current?.setMode('explore')}
+                    className={`rounded px-2.5 py-1 text-xs whitespace-nowrap transition-colors ${
+                      hud.mode === 'explore'
+                        ? 'bg-stone-100 font-semibold text-stone-950'
+                        : 'text-stone-300 hover:text-white'
+                    }`}
+                  >
+                    Explore
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => controllerRef.current?.setMode('plant')}
+                    className={`inline-flex items-center gap-1 rounded px-2.5 py-1 text-xs whitespace-nowrap transition-colors ${
+                      hud.mode === 'plant'
+                        ? 'bg-emerald-300 font-semibold text-stone-950'
+                        : 'text-stone-300 hover:text-white'
+                    }`}
+                  >
+                    <Sprout className="h-3 w-3" />
+                    <span>Plant</span>
+                  </button>
                 </div>
+
+                {hud.mode === 'plant' && (
+                  <div className="flex items-center gap-1 rounded border border-emerald-400/25 bg-black/60 p-0.5">
+                    {PLANT_SPECIES.map((sp) => (
+                      <button
+                        key={sp}
+                        type="button"
+                        onClick={() => controllerRef.current?.setPlantType(sp)}
+                        className={`rounded px-2 py-1 text-xs whitespace-nowrap transition-colors ${
+                          hud.plantType === sp
+                            ? 'bg-emerald-400/90 font-semibold text-stone-950'
+                            : 'text-stone-300 hover:text-white'
+                        }`}
+                      >
+                        {sp}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
+
+              {/* Context Target Filter (Explore Mode) */}
+              {hud.mode === 'explore' && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-stone-400 whitespace-nowrap">Target</span>
+                  <div className="flex items-center gap-1 rounded border border-white/10 bg-black/60 p-0.5">
+                    {INTERACTION_CONTEXTS.map((ctx) => (
+                      <button
+                        key={ctx}
+                        type="button"
+                        onClick={() => controllerRef.current?.setInteractionContext(ctx)}
+                        className={`rounded px-2.5 py-1 text-xs whitespace-nowrap transition-colors ${
+                          hud.interactionContext === ctx
+                            ? 'bg-cyan-300 font-semibold text-stone-950'
+                            : 'text-stone-300 hover:text-white'
+                        }`}
+                      >
+                        {ctx.replace(' Only', '')}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Physics Mode & Wake Reset */}
               <div className="flex items-center gap-2">
-                <select
-                  aria-label="Interaction physics mode"
-                  value={hud.interactionMode}
-                  onChange={(e) =>
-                    controllerRef.current?.setInteractionMode(e.target.value as InteractionMode)
-                  }
-                  className="rounded border border-white/15 bg-black px-2.5 py-1.5 text-xs text-stone-100 focus:border-cyan-300 focus:outline-none"
-                >
-                  {INTERACTION_MODES.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
+                {hud.mode === 'explore' && (
+                  <select
+                    aria-label="Interaction physics mode"
+                    value={hud.interactionMode}
+                    onChange={(e) =>
+                      controllerRef.current?.setInteractionMode(e.target.value as InteractionMode)
+                    }
+                    className="rounded border border-white/15 bg-black px-2.5 py-1.5 text-xs text-stone-100 focus:border-cyan-300 focus:outline-none"
+                  >
+                    {INTERACTION_MODES.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                )}
 
                 <button
                   type="button"

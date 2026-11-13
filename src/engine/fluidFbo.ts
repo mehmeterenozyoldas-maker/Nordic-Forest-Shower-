@@ -20,24 +20,62 @@ const SIM_FRAGMENT = /* glsl */ `
   uniform sampler2D uPrevTex;
   uniform vec2 uTexelSize;
   uniform float uDt;
+  uniform float uModeId;
+
   uniform vec2 uSplatUv;
   uniform vec2 uSplatVel;
   uniform float uSplatRadiusUv;
   uniform float uSplatEnergy;
   uniform float uSplatActive;
-  uniform float uModeId;
+
+  uniform vec2 uSplat2Uv;
+  uniform vec2 uSplat2Vel;
+  uniform float uSplat2RadiusUv;
+  uniform float uSplat2Energy;
+  uniform float uSplat2Active;
 
   varying vec2 vUv;
+
+  void injectSplat(
+    vec2 splatUv,
+    vec2 splatVel,
+    float radiusUv,
+    float splatEnergy,
+    inout vec2 bVel,
+    inout float energy,
+    inout float ripple
+  ) {
+    vec2 diff = vUv - splatUv;
+    float d = length(diff);
+    float r = max(0.015, radiusUv);
+    float splat = exp(-(d * d) / (r * r));
+
+    vec2 radialDir = d > 0.0001 ? normalize(diff) : vec2(0.0);
+    vec2 tangentDir = vec2(-radialDir.y, radialDir.x);
+
+    vec2 injectVel = splatVel;
+    if (abs(uModeId - 1.0) < 0.25) {
+      injectVel += tangentDir * 0.85;
+    } else if (abs(uModeId - 2.0) < 0.25) {
+      injectVel += radialDir * 0.7;
+    } else if (abs(uModeId - 3.0) < 0.25) {
+      injectVel += tangentDir * 0.35;
+    }
+
+    bVel = clamp(bVel + injectVel * splat * min(uDt * 12.0, 0.65), vec2(-1.0), vec2(1.0));
+    energy = clamp(energy + splat * clamp(splatEnergy, 0.15, 1.5) * min(uDt * 5.0, 0.55), 0.0, 1.0);
+
+    float ring = exp(-pow((d - r * 0.65) / (r * 0.35), 2.0));
+    ripple = clamp(ripple + ring * clamp(splatEnergy, 0.2, 1.2) * min(uDt * 4.5, 0.5), 0.0, 1.0);
+  }
 
   void main() {
     vec4 center = texture2D(uPrevTex, vUv);
     vec2 vel = (center.rg - 0.5) * 2.0;
 
-    // Semi-Lagrangian self-advection along stored wake velocity
     vec2 advUv = clamp(vUv - vel * uDt * 0.16, vec2(0.002), vec2(0.998));
     vec4 advected = texture2D(uPrevTex, advUv);
 
-    // 4-neighbor Laplacian diffusion for smooth vortex spread
     vec4 n = texture2D(uPrevTex, clamp(advUv + vec2(0.0, uTexelSize.y), 0.002, 0.998));
     vec4 s = texture2D(uPrevTex, clamp(advUv - vec2(0.0, uTexelSize.y), 0.002, 0.998));
     vec4 e = texture2D(uPrevTex, clamp(advUv + vec2(uTexelSize.x, 0.0), 0.002, 0.998));
@@ -49,56 +87,36 @@ const SIM_FRAGMENT = /* glsl */ `
     float energy = blurred.b;
     float ripple = blurred.a;
 
-    // Slight vorticity curl rotation so wakes curve organically
     float curlAngle = (e.b - w.b - n.b + s.b) * uDt * 2.8;
     float ca = cos(curlAngle);
     float sa = sin(curlAngle);
     bVel = vec2(bVel.x * ca - bVel.y * sa, bVel.x * sa + bVel.y * ca);
 
-    // Exponential dissipation
-    float velDecay = exp(-uDt * 0.85);
-    float energyDecay = exp(-uDt * 0.65);
-    float rippleDecay = exp(-uDt * 1.15);
+    bVel *= exp(-uDt * 0.85);
+    energy *= exp(-uDt * 0.65);
+    ripple *= exp(-uDt * 1.15);
 
-    bVel *= velDecay;
-    energy *= energyDecay;
-    ripple *= rippleDecay;
-
-    // Inject cursor / hand / sensor splat
     if (uSplatActive > 0.5) {
-      vec2 diff = vUv - uSplatUv;
-      float d = length(diff);
-      float r = max(0.015, uSplatRadiusUv);
-      float splat = exp(-(d * d) / (r * r));
-
-      vec2 radialDir = d > 0.0001 ? normalize(diff) : vec2(0.0);
-      vec2 tangentDir = vec2(-radialDir.y, radialDir.x);
-
-      vec2 injectVel = uSplatVel;
-      // Add subtle swirl in Tornado or Fluid modes
-      if (abs(uModeId - 1.0) < 0.25) {
-        injectVel += tangentDir * 0.85;
-      } else if (abs(uModeId - 2.0) < 0.25) {
-        injectVel += radialDir * 0.7;
-      } else if (abs(uModeId - 3.0) < 0.25) {
-        injectVel += tangentDir * 0.35;
-      }
-
-      bVel = clamp(bVel + injectVel * splat * min(uDt * 12.0, 0.65), vec2(-1.0), vec2(1.0));
-      energy = clamp(energy + splat * clamp(uSplatEnergy, 0.15, 1.5) * min(uDt * 5.0, 0.55), 0.0, 1.0);
-
-      // Ring wave injection for Seismic / Fluid
-      float ring = exp(-pow((d - r * 0.65) / (r * 0.35), 2.0));
-      ripple = clamp(ripple + ring * clamp(uSplatEnergy, 0.2, 1.2) * min(uDt * 4.5, 0.5), 0.0, 1.0);
+      injectSplat(uSplatUv, uSplatVel, uSplatRadiusUv, uSplatEnergy, bVel, energy, ripple);
+    }
+    if (uSplat2Active > 0.5) {
+      injectSplat(uSplat2Uv, uSplat2Vel, uSplat2RadiusUv, uSplat2Energy, bVel, energy, ripple);
     }
 
     gl_FragColor = vec4(bVel * 0.5 + 0.5, energy, ripple);
   }
 `;
 
+export interface WakeSplatInput {
+  worldPos: THREE.Vector3;
+  velocity: THREE.Vector3;
+  radiusWorld: number;
+  force: number;
+  active: boolean;
+}
+
 /**
- * GPU Ping-Pong FBO simulation covering the 70x70 world XZ footprint.
- * Stores persistent velocity (R, G), wake energy (B), and wave ripple (A).
+ * Dual-splat GPU Ping-Pong FBO simulation covering the 70x70 world XZ footprint.
  */
 export class FluidWakeSimulation {
   private targetA: THREE.WebGLRenderTarget;
@@ -153,12 +171,17 @@ export class FluidWakeSimulation {
         uPrevTex: { value: this.readTarget.texture },
         uTexelSize: { value: new THREE.Vector2(1 / resolution, 1 / resolution) },
         uDt: { value: 0.016 },
+        uModeId: { value: 3.0 },
         uSplatUv: { value: new THREE.Vector2(0.5, 0.5) },
         uSplatVel: { value: new THREE.Vector2(0.0, 0.0) },
         uSplatRadiusUv: { value: 0.08 },
         uSplatEnergy: { value: 0.0 },
         uSplatActive: { value: 0.0 },
-        uModeId: { value: 3.0 },
+        uSplat2Uv: { value: new THREE.Vector2(0.5, 0.5) },
+        uSplat2Vel: { value: new THREE.Vector2(0.0, 0.0) },
+        uSplat2RadiusUv: { value: 0.08 },
+        uSplat2Energy: { value: 0.0 },
+        uSplat2Active: { value: 0.0 },
       },
       vertexShader: SIM_VERTEX,
       fragmentShader: SIM_FRAGMENT,
@@ -179,6 +202,9 @@ export class FluidWakeSimulation {
 
   public clear(renderer: THREE.WebGLRenderer): void {
     const prevTarget = renderer.getRenderTarget();
+    const prevXr = renderer.xr.enabled;
+    renderer.xr.enabled = false;
+
     this.simQuad.material = this.clearMaterial;
 
     renderer.setRenderTarget(this.targetA);
@@ -188,50 +214,68 @@ export class FluidWakeSimulation {
     renderer.render(this.simScene, this.simCamera);
 
     renderer.setRenderTarget(prevTarget);
+    renderer.xr.enabled = prevXr;
     this.simQuad.material = this.simMaterial;
   }
 
   public step(
     renderer: THREE.WebGLRenderer,
     dt: number,
-    worldPos: THREE.Vector3,
-    velocity: THREE.Vector3,
-    radiusWorld: number,
-    force: number,
     modeId: number,
-    active: boolean,
+    splatA: WakeSplatInput,
+    splatB?: WakeSplatInput,
   ): void {
     const clampedDt = Math.min(Math.max(dt, 0.001), 0.05);
-    const u = worldPos.x / this.worldSize + 0.5;
-    const v = worldPos.z / this.worldSize + 0.5;
-
     const uniforms = this.simMaterial.uniforms;
     uniforms.uPrevTex.value = this.readTarget.texture;
     uniforms.uDt.value = clampedDt;
-    uniforms.uSplatUv.value.set(u, v);
-
-    // Normalize velocity into [-1, 1] range for stable advection
-    const vx = THREE.MathUtils.clamp(velocity.x / 22.0, -1.0, 1.0);
-    const vz = THREE.MathUtils.clamp(velocity.z / 22.0, -1.0, 1.0);
-    uniforms.uSplatVel.value.set(vx, vz);
-
-    uniforms.uSplatRadiusUv.value = THREE.MathUtils.clamp(radiusWorld / this.worldSize, 0.02, 0.35);
-    const velMag = Math.hypot(velocity.x, velocity.z);
-    const energy = THREE.MathUtils.clamp(Math.abs(force) * 0.4 + velMag * 0.04, 0.15, 1.5);
-    uniforms.uSplatEnergy.value = energy;
-    uniforms.uSplatActive.value = active && u >= -0.1 && u <= 1.1 && v >= -0.1 && v <= 1.1 ? 1.0 : 0.0;
     uniforms.uModeId.value = modeId;
 
+    this.assignSplat(splatA, 'uSplat');
+    if (splatB) {
+      this.assignSplat(splatB, 'uSplat2');
+    } else {
+      uniforms.uSplat2Active.value = 0.0;
+    }
+
     const prevTarget = renderer.getRenderTarget();
+    const prevXr = renderer.xr.enabled;
+    renderer.xr.enabled = false;
+
     this.simQuad.material = this.simMaterial;
     renderer.setRenderTarget(this.writeTarget);
     renderer.render(this.simScene, this.simCamera);
     renderer.setRenderTarget(prevTarget);
+    renderer.xr.enabled = prevXr;
 
-    // Swap ping-pong buffers
     const temp = this.readTarget;
     this.readTarget = this.writeTarget;
     this.writeTarget = temp;
+  }
+
+  private assignSplat(splat: WakeSplatInput, prefix: 'uSplat' | 'uSplat2'): void {
+    const uniforms = this.simMaterial.uniforms;
+    const u = splat.worldPos.x / this.worldSize + 0.5;
+    const v = splat.worldPos.z / this.worldSize + 0.5;
+    (uniforms[`${prefix}Uv`].value as THREE.Vector2).set(u, v);
+
+    const vx = THREE.MathUtils.clamp(splat.velocity.x / 22.0, -1.0, 1.0);
+    const vz = THREE.MathUtils.clamp(splat.velocity.z / 22.0, -1.0, 1.0);
+    (uniforms[`${prefix}Vel`].value as THREE.Vector2).set(vx, vz);
+
+    uniforms[`${prefix}RadiusUv`].value = THREE.MathUtils.clamp(
+      splat.radiusWorld / this.worldSize,
+      0.02,
+      0.35,
+    );
+    const velMag = Math.hypot(splat.velocity.x, splat.velocity.z);
+    uniforms[`${prefix}Energy`].value = THREE.MathUtils.clamp(
+      Math.abs(splat.force) * 0.4 + velMag * 0.04,
+      0.15,
+      1.5,
+    );
+    uniforms[`${prefix}Active`].value =
+      splat.active && u >= -0.1 && u <= 1.1 && v >= -0.1 && v <= 1.1 ? 1.0 : 0.0;
   }
 
   public dispose(): void {

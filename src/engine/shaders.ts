@@ -3,17 +3,26 @@ import * as THREE from 'three';
 export const FOREST_VERTEX_SHADER = /* glsl */ `
   attribute vec3 color;
   attribute float type; // 0 = wood, 1 = leaf, 2 = ground, 3 = water
+  attribute float aBirthTime;
+  attribute float aHint;
 
   uniform float uTime;
   uniform vec3 uMouse;
   uniform float uRadius;
   uniform float uForce;
+  uniform vec3 uMouseVelocity;
+
+  uniform vec3 uMouse2;
+  uniform float uForce2;
+  uniform vec3 uMouseVelocity2;
+  uniform float uActive2;
+
   uniform float uInteractionType;
   uniform float uInteractionContext;
   uniform vec3 uWindDir;
   uniform float uWindStrength;
-  uniform vec3 uMouseVelocity;
   uniform sampler2D uWakeTex;
+  uniform vec3 uSeasonWeights; // (autumn, spring, winter)
 
   varying float vDisplacement;
   varying vec3 vPosition;
@@ -22,6 +31,9 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
   varying float vRustle;
   varying float vSwirl;
   varying float vAurora;
+  varying float vSapGlow;
+  varying float vBirthSpark;
+  varying float vHint;
   varying vec3 vWorldNormal;
   varying vec3 vVelocity;
 
@@ -93,12 +105,110 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
     return mat2(cos(_angle), -sin(_angle), sin(_angle), cos(_angle));
   }
 
+  void applyCursorForce(
+    vec3 cursorPos,
+    float cursorForce,
+    vec3 cursorVel,
+    float contextMask,
+    float scatterMult,
+    vec3 noiseVec,
+    inout vec4 worldPosition,
+    inout vec3 displacement,
+    inout float swirl,
+    inout float auroraOut,
+    inout float maxInfluence
+  ) {
+    float dist = distance(worldPosition.xyz, cursorPos);
+    float influence = (1.0 - smoothstep(0.0, uRadius, dist)) * contextMask;
+    maxInfluence = max(maxInfluence, influence);
+
+    vec3 toCursor = worldPosition.xyz - cursorPos;
+    vec3 dir = length(toCursor) > 0.001 ? normalize(toCursor) : vec3(0.0, 1.0, 0.0);
+    dir = normalize(dir + vec3(0.0, 0.2, 0.0));
+    float noiseAmp = (cursorForce > 0.0) ? 1.0 : 0.2;
+
+    if (uInteractionType == 1.0 && influence > 0.0) {
+      swirl = max(swirl, influence);
+      float angle = influence * uTime * 15.0;
+      vec3 toParticle = worldPosition.xyz - cursorPos;
+      vec2 rotatedXZ = rotate2d(angle) * toParticle.xz;
+      worldPosition.x = cursorPos.x + rotatedXZ.x;
+      worldPosition.z = cursorPos.z + rotatedXZ.y;
+      vec3 newDir = normalize(worldPosition.xyz - cursorPos + vec3(0.0001));
+      vec3 d = (newDir * cursorForce * 0.5 + noiseVec * noiseAmp + vec3(0.0, 2.0, 0.0)) * influence * scatterMult;
+      worldPosition.xyz += d;
+      displacement += d;
+    } else if (uInteractionType == 2.0 && influence > 0.0) {
+      vec3 d = vec3(dir.x, 0.0, dir.z) * abs(cursorForce) * 2.0 * influence * scatterMult + noiseVec * noiseAmp * influence;
+      worldPosition.xyz += d;
+      displacement += d;
+    } else if (uInteractionType == 3.0 && influence > 0.0) {
+      float mouseSpeed = clamp(length(cursorVel), 0.0, 20.0);
+      vec3 mouseDir = mouseSpeed > 0.01 ? normalize(cursorVel) : dir;
+      vec3 advection = mouseDir * mouseSpeed * influence * 0.3;
+
+      vec3 toParticle = normalize(worldPosition.xyz - cursorPos + vec3(0.0001));
+      vec3 vortexAxis = cross(mouseDir, toParticle);
+      if (length(vortexAxis) < 0.01) vortexAxis = vec3(0.0, 1.0, 0.0);
+      vec3 curl = normalize(cross(vortexAxis, toParticle)) * snoise(position * 2.0 + uTime * 2.0) * abs(cursorForce);
+
+      if (type == 3.0) {
+        advection.y += mouseSpeed * influence * 0.5 * sign(cursorForce);
+        curl *= 0.5;
+      } else if (type == 1.0) {
+        curl *= 2.0;
+      } else if (type == 2.0) {
+        advection = vec3(0.0, cursorForce * influence * 2.0, 0.0);
+        curl = vec3(0.0);
+      }
+
+      vec3 d = (advection + curl * 2.0 + noiseVec * noiseAmp) * influence * scatterMult;
+      worldPosition.xyz += d;
+      displacement += d;
+    } else if (uInteractionType == 4.0 && contextMask > 0.5) {
+      float wave = sin(dist * 3.0 - uTime * 15.0) * exp(-dist * 0.3);
+      vec3 d = vec3(0.0, 1.0, 0.0) * wave * abs(cursorForce) * 8.0 * scatterMult;
+      d += dir * wave * cursorForce * 2.0 * scatterMult;
+      worldPosition.xyz += d;
+      displacement += d;
+    } else if (uInteractionType == 5.0 && contextMask > 0.5) {
+      float lift = smoothstep(uRadius * 1.5, 0.0, dist) * abs(cursorForce) * 8.0;
+      vec3 magneticUp = vec3(0.0, 1.0, 0.0) * lift;
+      vec3 swirlDir = cross(dir, vec3(0.0, 1.0, 0.0));
+      if (length(swirlDir) < 0.01) swirlDir = vec3(1.0, 0.0, 0.0);
+      vec3 d = (magneticUp + normalize(swirlDir) * lift * 0.8 + noiseVec * lift * 0.3) * scatterMult;
+      worldPosition.xyz += d;
+      displacement += d;
+      auroraOut = max(auroraOut, influence * smoothstep(0.0, 15.0, d.y));
+    } else if (uInteractionType == 0.0 && influence > 0.0) {
+      vec3 gustDir = vec3(1.0, 0.2, 0.5);
+      vec3 d = (gustDir * cursorForce + noiseVec * noiseAmp) * influence * scatterMult;
+      worldPosition.xyz += d;
+      displacement += d;
+    }
+  }
+
   void main() {
     vPosition = position;
     vColor = color;
     vType = type;
+    vHint = aHint;
 
     vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+
+    // Planted Tree Spring Pop-In Growth Animation
+    float birthScale = 1.0;
+    float birthSpark = 0.0;
+    if (aBirthTime >= 0.0) {
+      float age = max(0.0, uTime - aBirthTime);
+      float t = clamp(age / 0.85, 0.0, 1.0);
+      // Elastic ease-out pop
+      float ease = 1.0 - pow(1.0 - t, 3.0);
+      birthScale = mix(0.05, 1.0, ease);
+      worldPosition.y -= (1.0 - ease) * 2.6;
+      birthSpark = (1.0 - t) * step(age, 0.9);
+    }
+    vBirthSpark = birthSpark;
 
     // Wind & Ambient Motion
     float windSpeed = uTime * 0.5;
@@ -138,13 +248,10 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
 
     // Context Masking
     bool canInteract = true;
-    if (uInteractionContext == 1.0 && type > 1.5) canInteract = false; // Trees only
-    if (uInteractionContext == 2.0 && type != 3.0) canInteract = false; // Water only
-    if (uInteractionContext == 3.0 && type != 2.0) canInteract = false; // Ground only
+    if (uInteractionContext == 1.0 && type > 1.5) canInteract = false;
+    if (uInteractionContext == 2.0 && type != 3.0) canInteract = false;
+    if (uInteractionContext == 3.0 && type != 2.0) canInteract = false;
     float contextMask = canInteract ? 1.0 : 0.0;
-
-    float dist = distance(worldPosition.xyz, uMouse);
-    float influence = (1.0 - smoothstep(0.0, uRadius, dist)) * contextMask;
 
     vec3 noiseVec = vec3(
       snoise(position * 1.5 + uTime * 0.5),
@@ -152,79 +259,47 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
       snoise(position * 1.5 + uTime * 0.5 + 200.0)
     );
 
-    vec3 toCursor = worldPosition.xyz - uMouse;
-    vec3 dir = length(toCursor) > 0.001 ? normalize(toCursor) : vec3(0.0, 1.0, 0.0);
-    dir = normalize(dir + vec3(0.0, 0.2, 0.0));
-
     float scatterMult = 1.5;
     if (type == 1.0) scatterMult = 3.0;
     if (type == 3.0) scatterMult = 2.0;
     if (type == 2.0) scatterMult = 0.5;
     if (type == 0.0) scatterMult = 0.2;
 
-    float noiseAmp = (uForce > 0.0) ? 1.0 : 0.2;
     vec3 displacement = vec3(0.0);
     float swirl = 0.0;
-    vAurora = 0.0;
+    float auroraVal = 0.0;
+    float maxInfluence = 0.0;
 
-    if (uInteractionType == 1.0 && influence > 0.0) {
-      // Tornado Mode
-      swirl = influence;
-      float angle = influence * uTime * 15.0;
-      vec3 toParticle = worldPosition.xyz - uMouse;
-      vec2 rotatedXZ = rotate2d(angle) * toParticle.xz;
-      worldPosition.x = uMouse.x + rotatedXZ.x;
-      worldPosition.z = uMouse.z + rotatedXZ.y;
-      vec3 newDir = normalize(worldPosition.xyz - uMouse + vec3(0.0001));
-      displacement = (newDir * uForce * 0.5 + noiseVec * noiseAmp + vec3(0.0, 2.0, 0.0)) * influence * scatterMult;
-      worldPosition.xyz += displacement;
-    } else if (uInteractionType == 2.0 && influence > 0.0) {
-      // Parting Mode
-      displacement = vec3(dir.x, 0.0, dir.z) * abs(uForce) * 2.0 * influence * scatterMult + noiseVec * noiseAmp * influence;
-      worldPosition.xyz += displacement;
-    } else if (uInteractionType == 3.0 && influence > 0.0) {
-      // Fluid Push/Pull
-      float mouseSpeed = clamp(length(uMouseVelocity), 0.0, 20.0);
-      vec3 mouseDir = mouseSpeed > 0.01 ? normalize(uMouseVelocity) : dir;
-      vec3 advection = mouseDir * mouseSpeed * influence * 0.3;
+    // Primary Cursor / Hand / Controller
+    applyCursorForce(
+      uMouse,
+      uForce,
+      uMouseVelocity,
+      contextMask,
+      scatterMult,
+      noiseVec,
+      worldPosition,
+      displacement,
+      swirl,
+      auroraVal,
+      maxInfluence
+    );
 
-      vec3 toParticle = normalize(worldPosition.xyz - uMouse + vec3(0.0001));
-      vec3 vortexAxis = cross(mouseDir, toParticle);
-      if (length(vortexAxis) < 0.01) vortexAxis = vec3(0.0, 1.0, 0.0);
-      vec3 curl = normalize(cross(vortexAxis, toParticle)) * snoise(position * 2.0 + uTime * 2.0) * abs(uForce);
-
-      if (type == 3.0) {
-        advection.y += mouseSpeed * influence * 0.5 * sign(uForce);
-        curl *= 0.5;
-      } else if (type == 1.0) {
-        curl *= 2.0;
-      } else if (type == 2.0) {
-        advection = vec3(0.0, uForce * influence * 2.0, 0.0);
-        curl = vec3(0.0);
-      }
-
-      displacement = (advection + curl * 2.0 + noiseVec * noiseAmp) * influence * scatterMult;
-      worldPosition.xyz += displacement;
-    } else if (uInteractionType == 4.0 && contextMask > 0.5) {
-      // Seismic Ripple
-      float wave = sin(dist * 3.0 - uTime * 15.0) * exp(-dist * 0.3);
-      displacement = vec3(0.0, 1.0, 0.0) * wave * abs(uForce) * 8.0 * scatterMult;
-      displacement += dir * wave * uForce * 2.0 * scatterMult;
-      worldPosition.xyz += displacement;
-    } else if (uInteractionType == 5.0 && contextMask > 0.5) {
-      // Aurora Field
-      float lift = smoothstep(uRadius * 1.5, 0.0, dist) * abs(uForce) * 8.0;
-      vec3 magneticUp = vec3(0.0, 1.0, 0.0) * lift;
-      vec3 swirlDir = cross(dir, vec3(0.0, 1.0, 0.0));
-      if (length(swirlDir) < 0.01) swirlDir = vec3(1.0, 0.0, 0.0);
-      displacement = (magneticUp + normalize(swirlDir) * lift * 0.8 + noiseVec * lift * 0.3) * scatterMult;
-      worldPosition.xyz += displacement;
-      vAurora = influence * smoothstep(0.0, 15.0, displacement.y);
-    } else if (uInteractionType == 0.0 && influence > 0.0) {
-      // Wind Gust Mode
-      vec3 gustDir = vec3(1.0, 0.2, 0.5);
-      displacement = (gustDir * uForce + noiseVec * noiseAmp) * influence * scatterMult;
-      worldPosition.xyz += displacement;
+    // Secondary Hand / VR Controller
+    if (uActive2 > 0.5) {
+      applyCursorForce(
+        uMouse2,
+        uForce2,
+        uMouseVelocity2,
+        contextMask,
+        scatterMult,
+        noiseVec,
+        worldPosition,
+        displacement,
+        swirl,
+        auroraVal,
+        maxInfluence
+      );
     }
 
     // Persistent GPU Ping-Pong Wake Field Coupling
@@ -241,12 +316,22 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
       if (type == 2.0 && uInteractionType != 4.0) wakeDisp.xz *= 0.25;
       if (uInteractionType == 5.0) {
         wakeDisp.y += wakeEnergy * 4.5 * scatterMult * 0.35;
-        vAurora = max(vAurora, wakeEnergy * 0.75);
+        auroraVal = max(auroraVal, wakeEnergy * 0.85);
       }
       worldPosition.xyz += wakeDisp;
       displacement += wakeDisp;
     }
 
+    // Glowing Tree-Sap Veins (pulse upward along trunk wood when energized)
+    float sapPulse = 0.0;
+    if (type == 0.0) {
+      float veinNoise = sin(position.y * 2.8 - uTime * 3.4 + position.x * 1.7 + aHint * 6.28);
+      float activity = clamp(wakeEnergy * 1.4 + maxInfluence * 1.1 + uSeasonWeights.z * 0.35, 0.0, 1.0);
+      sapPulse = smoothstep(0.65, 0.98, veinNoise) * activity;
+    }
+    vSapGlow = sapPulse;
+
+    vAurora = auroraVal;
     vDisplacement = length(displacement);
     vSwirl = swirl;
     vVelocity = displacement;
@@ -262,9 +347,9 @@ export const FOREST_VERTEX_SHADER = /* glsl */ `
     if (type == 1.0) baseSize = 6.0 + rustle * 1.0;
     if (type == 3.0) baseSize = 4.0;
     if (type == 2.0) baseSize = 3.0;
-    if (type == 0.0) baseSize = 4.0;
+    if (type == 0.0) baseSize = 4.0 + sapPulse * 1.5;
 
-    gl_PointSize = (baseSize + influence * 2.0 + wakeEnergy * 1.5) * (20.0 / max(1.0, -mvPosition.z));
+    gl_PointSize = (baseSize + maxInfluence * 2.0 + wakeEnergy * 1.5 + birthSpark * 3.0) * birthScale * (20.0 / max(1.0, -mvPosition.z));
   }
 `;
 
@@ -273,6 +358,7 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uSunDirection;
   uniform vec3 uSunColor;
   uniform float uFogDensity;
+  uniform vec3 uSeasonWeights; // (autumn, spring, winter)
 
   varying float vDisplacement;
   varying vec3 vPosition;
@@ -281,6 +367,9 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
   varying float vRustle;
   varying float vSwirl;
   varying float vAurora;
+  varying float vSapGlow;
+  varying float vBirthSpark;
+  varying float vHint;
   varying vec3 vWorldNormal;
   varying vec3 vVelocity;
 
@@ -288,7 +377,37 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
     vec2 coord = gl_PointCoord - vec2(0.5);
     float dist = length(coord);
     float alphaMult = 1.0;
+
+    // GPU Seasonal Palette Morphing (Zero CPU Buffer Regeneration Stall)
     vec3 finalBaseColor = vColor;
+    if (vType == 1.0) {
+      // Foliage shifts smoothly: Autumn (base) -> Spring verdant/blossom -> Winter frost/slate
+      vec3 springLeaf = mix(vec3(0.20, 0.42, 0.14), vec3(0.62, 0.74, 0.48), vHint);
+      if (vHint > 0.84) {
+        springLeaf = mix(springLeaf, vec3(0.88, 0.91, 0.84), 0.72); // Pale birch blossom highlights
+      }
+      vec3 winterLeaf = mix(vec3(0.14, 0.24, 0.27), vec3(0.82, 0.90, 0.98), smoothstep(0.45, 0.9, vHint));
+      finalBaseColor =
+        vColor * uSeasonWeights.x +
+        springLeaf * uSeasonWeights.y +
+        winterLeaf * uSeasonWeights.z;
+    } else if (vType == 2.0) {
+      // Ground shifts smoothly: Autumn earth -> Spring moss -> Winter snow crust
+      vec3 springGround = mix(vColor, vec3(0.18, 0.34, 0.19), 0.55 * vHint);
+      vec3 winterGround = mix(vec3(0.22, 0.26, 0.32), vec3(0.86, 0.92, 0.99), smoothstep(0.35, 0.85, vHint));
+      finalBaseColor =
+        vColor * uSeasonWeights.x +
+        springGround * uSeasonWeights.y +
+        winterGround * uSeasonWeights.z;
+    } else if (vType == 3.0) {
+      // River water warms slightly in spring and takes icy steel reflections in winter
+      vec3 springWater = mix(vColor, vec3(0.08, 0.34, 0.44), 0.45);
+      vec3 winterWater = mix(vColor, vec3(0.22, 0.38, 0.52), 0.65);
+      finalBaseColor =
+        vColor * uSeasonWeights.x +
+        springWater * uSeasonWeights.y +
+        winterWater * uSeasonWeights.z;
+    }
 
     // Volumetric Lighting / Mie Scattering Approximation
     vec3 viewDir = normalize(vPosition - cameraPosition);
@@ -301,9 +420,9 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
       if (dist > 0.45) discard;
       alphaMult = 0.9;
 
-      vec3 sssColor = vec3(0.8, 0.9, 0.3);
+      vec3 sssColor = mix(vec3(0.8, 0.9, 0.3), vec3(0.65, 0.9, 1.0), uSeasonWeights.z);
       float sssIntensity = smoothstep(0.0, 1.0, vRustle) * 0.3 + (1.0 - smoothstep(0.0, 0.45, dist)) * 0.15;
-      finalBaseColor = mix(vColor, sssColor, sssIntensity);
+      finalBaseColor = mix(finalBaseColor, sssColor, sssIntensity);
 
       float light = dot(vWorldNormal, uSunDirection);
       finalBaseColor *= 0.6 + 0.6 * max(0.0, light);
@@ -327,12 +446,23 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
       finalBaseColor *= 0.5 + 0.5 * max(0.0, light);
     }
 
+    // Glowing Tree-Sap Veins along wood trunk particles
+    if (vSapGlow > 0.01) {
+      vec3 sapColor = mix(vec3(0.25, 0.95, 0.78), vec3(0.95, 0.72, 0.28), uSeasonWeights.x);
+      finalBaseColor += sapColor * vSapGlow * 1.55;
+    }
+
+    // Newly planted tree golden-emerald birth shimmer
+    if (vBirthSpark > 0.01) {
+      finalBaseColor += vec3(0.55, 0.98, 0.78) * vBirthSpark * 1.4;
+    }
+
     // Soft volumetric radial fade
     float alpha = smoothstep(0.5, 0.1, dist) * alphaMult;
 
     float d = clamp(vDisplacement * 0.1, 0.0, 1.0);
     vec3 dustColor = vec3(0.6, 0.55, 0.45);
-    if (vType == 1.0) dustColor = vec3(0.4, 0.5, 0.2);
+    if (vType == 1.0) dustColor = mix(vec3(0.4, 0.5, 0.2), vec3(0.75, 0.88, 1.0), uSeasonWeights.z);
     if (vType == 3.0) dustColor = vec3(0.8, 0.9, 1.0);
 
     vec3 finalColor = mix(finalBaseColor, dustColor, d * 0.5);
@@ -344,17 +474,19 @@ export const FOREST_FRAGMENT_SHADER = /* glsl */ `
 
     vec3 baseFogColor = vec3(0.0);
     float heightFog = 1.0 - smoothstep(-4.0, 8.0, vPosition.y);
-    vec3 mistColor = vec3(0.08, 0.09, 0.14);
+    vec3 mistColor = mix(vec3(0.08, 0.09, 0.14), vec3(0.11, 0.15, 0.22), uSeasonWeights.z);
     vec3 finalFogColor = mix(baseFogColor, mistColor, heightFog * 0.6) + scatterColor * 0.8;
 
-    // Aurora coloring
+    // Aurora Ribbon Trails Coloring
     if (vAurora > 0.0) {
       vec3 auroraGreen = vec3(0.2, 1.0, 0.6);
-      vec3 auroraPurple = vec3(0.7, 0.3, 1.0);
-      vec3 aColor = mix(auroraGreen, auroraPurple, sin(vPosition.x * 0.2 + uTime * 0.5) * 0.5 + 0.5);
+      vec3 auroraTeal = vec3(0.15, 0.85, 0.95);
+      vec3 auroraPurple = vec3(0.72, 0.32, 1.0);
+      float ribbonWave = sin(vPosition.x * 0.18 + vPosition.z * 0.12 + uTime * 0.7) * 0.5 + 0.5;
+      vec3 aColor = mix(mix(auroraGreen, auroraTeal, 0.4), auroraPurple, ribbonWave);
       finalColor = mix(finalColor, aColor, vAurora);
-      alpha = min(1.0, alpha + vAurora * 0.6);
-      finalColor += aColor * vAurora * 1.8;
+      alpha = min(1.0, alpha + vAurora * 0.65);
+      finalColor += aColor * vAurora * 2.0;
     }
 
     // Velocity Field Color (VFC)
@@ -386,6 +518,11 @@ export function createForestMaterial(wakeTexture: THREE.Texture): THREE.ShaderMa
       uMouse: { value: new THREE.Vector3(999, 999, 999) },
       uRadius: { value: 5.0 },
       uForce: { value: 0.0 },
+      uMouseVelocity: { value: new THREE.Vector3(0, 0, 0) },
+      uMouse2: { value: new THREE.Vector3(999, 999, 999) },
+      uForce2: { value: 0.0 },
+      uMouseVelocity2: { value: new THREE.Vector3(0, 0, 0) },
+      uActive2: { value: 0.0 },
       uInteractionType: { value: 0.0 },
       uInteractionContext: { value: 0.0 },
       uWindDir: { value: new THREE.Vector3(1.0, 0.0, 0.0) },
@@ -393,8 +530,8 @@ export function createForestMaterial(wakeTexture: THREE.Texture): THREE.ShaderMa
       uSunDirection: { value: new THREE.Vector3(1.0, 0.5, -1.0).normalize() },
       uSunColor: { value: new THREE.Color(1.0, 0.9, 0.8) },
       uFogDensity: { value: 0.018 },
-      uMouseVelocity: { value: new THREE.Vector3(0, 0, 0) },
       uWakeTex: { value: wakeTexture },
+      uSeasonWeights: { value: new THREE.Vector3(1.0, 0.0, 0.0) },
     },
     transparent: true,
     blending: THREE.NormalBlending,

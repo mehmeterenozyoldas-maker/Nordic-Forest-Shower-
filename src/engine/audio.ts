@@ -1,3 +1,4 @@
+import * as THREE from 'three';
 import * as Tone from 'tone';
 import { InteractionMode } from '../types/simulation';
 
@@ -5,11 +6,20 @@ export class SoundscapeEngine {
   private initialized = false;
   private muted = false;
   private masterVol: Tone.Volume | null = null;
+  private meter: Tone.Meter | null = null;
+  private panner: Tone.Panner3D | null = null;
+
   private windFilter: Tone.Filter | null = null;
   private windNoise: Tone.Noise | null = null;
   private auroraSynth: Tone.PolySynth | null = null;
   private waterSynth: Tone.FMSynth | null = null;
+  private plantSynth: Tone.PolySynth | null = null;
+
   private lastNoteAt = 0;
+  private smoothedEnergy = 0;
+
+  private readonly _forward = new THREE.Vector3();
+  private readonly _up = new THREE.Vector3();
 
   public get isInitialized(): boolean {
     return this.initialized;
@@ -33,6 +43,17 @@ export class SoundscapeEngine {
       this.masterVol = new Tone.Volume(-12).toDestination();
       this.masterVol.mute = this.muted;
 
+      this.meter = new Tone.Meter({ smoothing: 0.8 });
+      this.masterVol.connect(this.meter);
+
+      this.panner = new Tone.Panner3D({
+        panningModel: 'HRTF',
+        distanceModel: 'inverse',
+        refDistance: 8,
+        maxDistance: 120,
+        rolloffFactor: 0.55,
+      }).connect(this.masterVol);
+
       this.windFilter = new Tone.Filter(400, 'lowpass').connect(this.masterVol);
       this.windNoise = new Tone.Noise('pink').connect(this.windFilter).start();
       this.windNoise.volume.value = -16;
@@ -40,16 +61,22 @@ export class SoundscapeEngine {
       this.auroraSynth = new Tone.PolySynth(Tone.Synth, {
         oscillator: { type: 'sine' },
         envelope: { attack: 1.8, decay: 1.0, sustain: 0.7, release: 3.5 },
-      }).connect(this.masterVol);
-      this.auroraSynth.volume.value = -26;
+      }).connect(this.panner);
+      this.auroraSynth.volume.value = -24;
 
       this.waterSynth = new Tone.FMSynth({
         harmonicity: 2,
         modulationIndex: 3,
         oscillator: { type: 'sine' },
         envelope: { attack: 0.08, decay: 0.25, sustain: 0.1, release: 0.9 },
-      }).connect(this.masterVol);
-      this.waterSynth.volume.value = -20;
+      }).connect(this.panner);
+      this.waterSynth.volume.value = -18;
+
+      this.plantSynth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: 'triangle' },
+        envelope: { attack: 0.02, decay: 0.45, sustain: 0.08, release: 1.4 },
+      }).connect(this.panner);
+      this.plantSynth.volume.value = -16;
 
       this.initialized = true;
       return true;
@@ -63,6 +90,45 @@ export class SoundscapeEngine {
     if (this.masterVol) {
       this.masterVol.mute = mute;
     }
+  }
+
+  public syncSpatial(camera: THREE.Camera, cursorWorldPos: THREE.Vector3, active: boolean): void {
+    if (!this.initialized || !this.panner) return;
+
+    const listener = Tone.getListener();
+    camera.getWorldDirection(this._forward);
+    this._up.copy(camera.up).applyQuaternion(camera.quaternion);
+
+    listener.positionX.value = camera.position.x;
+    listener.positionY.value = camera.position.y;
+    listener.positionZ.value = camera.position.z;
+    listener.forwardX.value = this._forward.x;
+    listener.forwardY.value = this._forward.y;
+    listener.forwardZ.value = this._forward.z;
+    listener.upX.value = this._up.x;
+    listener.upY.value = this._up.y;
+    listener.upZ.value = this._up.z;
+
+    if (active && cursorWorldPos.x < 900) {
+      this.panner.positionX.rampTo(cursorWorldPos.x, 0.06);
+      this.panner.positionY.rampTo(cursorWorldPos.y, 0.06);
+      this.panner.positionZ.rampTo(cursorWorldPos.z, 0.06);
+    } else {
+      this.panner.positionX.rampTo(0, 0.15);
+      this.panner.positionY.rampTo(0, 0.15);
+      this.panner.positionZ.rampTo(0, 0.15);
+    }
+  }
+
+  public triggerPlantChime(): void {
+    if (!this.initialized || this.muted || !this.plantSynth) return;
+    const chords = [
+      ['D4', 'A4', 'E5'],
+      ['E4', 'B4', 'F#5'],
+      ['G4', 'D5', 'A5'],
+    ];
+    const chord = chords[Math.floor(Math.random() * chords.length)];
+    this.plantSynth.triggerAttackRelease(chord, '4n');
   }
 
   public modulate(windStrength: number, speed: number, mode: InteractionMode): void {
@@ -92,6 +158,18 @@ export class SoundscapeEngine {
     }
   }
 
+  public getAudioEnergy(): number {
+    if (!this.initialized || this.muted || !this.meter) {
+      this.smoothedEnergy *= 0.85;
+      return this.smoothedEnergy;
+    }
+    const val = this.meter.getValue();
+    const db = Array.isArray(val) ? val[0] : val;
+    const norm = Number.isFinite(db) ? THREE.MathUtils.clamp((db + 54) / 42, 0, 1) : 0;
+    this.smoothedEnergy = this.smoothedEnergy * 0.8 + norm * 0.2;
+    return this.smoothedEnergy;
+  }
+
   public dispose(): void {
     if (this.windNoise) {
       this.windNoise.stop();
@@ -100,6 +178,9 @@ export class SoundscapeEngine {
     this.windFilter?.dispose();
     this.auroraSynth?.dispose();
     this.waterSynth?.dispose();
+    this.plantSynth?.dispose();
+    this.panner?.dispose();
+    this.meter?.dispose();
     this.masterVol?.dispose();
     this.initialized = false;
   }

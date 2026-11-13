@@ -1,5 +1,9 @@
 export type Season = 'autumn' | 'spring' | 'winter';
 
+export type ModeType = 'explore' | 'plant';
+
+export type PlantSpecies = 'Oak' | 'Pine' | 'Bush';
+
 export type InteractionMode =
   | 'Wind Gust'
   | 'Tornado'
@@ -10,15 +14,16 @@ export type InteractionMode =
 
 export type InteractionContext = 'All' | 'Trees Only' | 'Water Only' | 'Ground Only';
 
-export type InputSourceType = 'pointer' | 'hands' | 'ble' | 'websocket' | 'playback';
+export type InputSourceType = 'pointer' | 'hands' | 'ble' | 'websocket' | 'playback' | 'webxr';
 
 export interface SimulationParams {
+  mode: ModeType;
   season: Season;
   riverWidth: number;
   terrainRoughness: number;
   treeScale: number;
   treeDensity: number;
-  plantType: 'Oak' | 'Pine' | 'Bush';
+  plantType: PlantSpecies;
   interactionMode: InteractionMode;
   interactionContext: InteractionContext;
   interactionRadius: number;
@@ -44,19 +49,11 @@ export interface ChapterDefinition {
   fogDensity: number;
   sunElevation: number;
   bloomStrength: number;
-}
-
-export interface InputFrame {
-  source: InputSourceType;
-  /** Normalized device coordinates in [-1, 1] */
-  ndcX: number;
-  ndcY: number;
-  /** Force multiplier in [0.1, 3.0] */
-  force: number;
-  /** Optional wind override from sensor stream */
-  windStrength?: number;
-  active: boolean;
-  timestamp: number;
+  cameraTarget: {
+    theta: number;
+    phi: number;
+    radius: number;
+  };
 }
 
 export interface SensorSample {
@@ -91,7 +88,12 @@ export type HandTrackingStatus = 'idle' | 'starting' | 'active' | 'error';
 export interface HandTrackingState {
   status: HandTrackingStatus;
   handDetected: boolean;
+  handsCount: number;
   pinchStrength: number;
+  secondaryPinchStrength: number;
+  twoHandZoomActive: boolean;
+  chapterGestureProgress: number;
+  gestureHint: string | null;
   error: string | null;
 }
 
@@ -114,11 +116,22 @@ export interface RecordingStatus {
   error: string | null;
 }
 
+export interface WebXRState {
+  supported: boolean;
+  active: boolean;
+  controllersConnected: number;
+  error: string | null;
+}
+
 export interface SimulationHUDState {
+  mode: ModeType;
+  plantType: PlantSpecies;
+  plantedCount: number;
   chapterIndex: number;
   interactionMode: InteractionMode;
   interactionContext: InteractionContext;
   activeSource: InputSourceType;
+  secondaryCursorActive: boolean;
   attractMode: boolean;
   audioEnabled: boolean;
   audioMuted: boolean;
@@ -130,6 +143,7 @@ export interface SimulationHUDState {
   hardware: HardwareConnectionState;
   playback: PlaybackStatus;
   recording: RecordingStatus;
+  webxr: WebXRState;
   webglLost: boolean;
   isSoftwareGl: boolean;
 }

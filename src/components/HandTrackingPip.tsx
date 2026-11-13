@@ -32,7 +32,7 @@ export const HandTrackingPip: React.FC<HandTrackingPipProps> = ({
       {isVisible && (
         <div
           aria-label="Hand tracking preview"
-          className="pointer-events-auto fixed right-6 top-20 z-30 w-56 overflow-hidden rounded-lg border border-white/15 bg-stone-950/95 shadow-2xl"
+          className="pointer-events-auto fixed right-6 top-20 z-30 w-60 overflow-hidden rounded-lg border border-white/15 bg-stone-950/95 shadow-2xl"
         >
           <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
             <div className="flex items-center gap-1.5 text-xs font-medium text-stone-100">
@@ -43,8 +43,10 @@ export const HandTrackingPip: React.FC<HandTrackingPipProps> = ({
                   : state.status === 'error'
                     ? 'Camera Error'
                     : state.handDetected
-                      ? 'Hand Locked'
-                      : 'Show Hand'}
+                      ? state.handsCount > 1
+                        ? '2 Hands Locked'
+                        : '1 Hand Locked'
+                      : 'Show Hand(s)'}
               </span>
             </div>
             <button
@@ -73,19 +75,47 @@ export const HandTrackingPip: React.FC<HandTrackingPipProps> = ({
             <div className="relative bg-black">
               <canvas
                 ref={previewCanvasRef}
-                width={224}
-                height={150}
-                className="block h-[150px] w-full"
+                width={240}
+                height={156}
+                className="block h-[156px] w-full"
               />
               {state.status === 'starting' && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/75 px-3 text-center text-[11px] text-stone-300">
-                  Loading hand landmark model...
+                  Loading dual-hand landmark model...
                 </div>
               )}
+
+              {state.twoHandZoomActive && (
+                <div className="absolute left-2 top-2 rounded border border-cyan-300/50 bg-stone-950/90 px-2 py-0.5 text-[10px] font-medium text-cyan-200">
+                  Pinch-Zoom Active
+                </div>
+              )}
+
+              {state.chapterGestureProgress > 0 && (
+                <div className="absolute inset-x-2 bottom-9 rounded border border-amber-300/40 bg-stone-950/90 px-2 py-1">
+                  <div className="flex items-center justify-between text-[10px] text-amber-200">
+                    <span>Hold Peace Sign · Next Chapter</span>
+                    <span className="font-mono-tabular">
+                      {Math.round(state.chapterGestureProgress * 100)}%
+                    </span>
+                  </div>
+                  <div className="mt-1 h-1 w-full overflow-hidden rounded bg-white/15">
+                    <div
+                      className="h-full bg-amber-300 transition-[width] duration-75"
+                      style={{ width: `${Math.round(state.chapterGestureProgress * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
               {state.status === 'active' && (
                 <div className="flex items-center justify-between border-t border-white/10 bg-stone-950/90 px-3 py-1.5 font-mono-tabular text-[11px] text-stone-400">
-                  <span>Index · Cursor</span>
                   <span>Pinch {Math.round(state.pinchStrength * 100)}%</span>
+                  <span>
+                    {state.handsCount > 1
+                      ? `H2 ${Math.round(state.secondaryPinchStrength * 100)}%`
+                      : 'V-Pose: Chapter'}
+                  </span>
                 </div>
               )}
             </div>

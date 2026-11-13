@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { Season, SimulationParams } from '../types/simulation';
+import { PlantSpecies, Season, SimulationParams } from '../types/simulation';
 
 export const PARTICLE_COUNT = 1_500_000;
 export const TERRAIN_SIZE = 70;
@@ -66,9 +66,10 @@ export class ParticleEnvironment {
   private readonly positions: Float32Array;
   private readonly colors: Float32Array;
   private readonly types: Float32Array;
+  private readonly birthTimes: Float32Array;
+  private readonly colorHints: Float32Array; // Moisture / Palette seed for smooth GPU season morphing
   private pIndex = 0;
 
-  // Scratchpad vectors for generation
   private readonly _axis = new THREE.Vector3();
   private readonly _perp = new THREE.Vector3();
   private readonly _perp2 = new THREE.Vector3();
@@ -79,9 +80,12 @@ export class ParticleEnvironment {
     this.positions = new Float32Array(PARTICLE_COUNT * 3);
     this.colors = new Float32Array(PARTICLE_COUNT * 3);
     this.types = new Float32Array(PARTICLE_COUNT);
+    this.birthTimes = new Float32Array(PARTICLE_COUNT);
+    this.colorHints = new Float32Array(PARTICLE_COUNT);
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       this.positions[i * 3 + 1] = -10000;
+      this.birthTimes[i] = -10.0;
     }
 
     this.generate(initialParams, false);
@@ -89,9 +93,19 @@ export class ParticleEnvironment {
     this.geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
     this.geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
     this.geometry.setAttribute('type', new THREE.BufferAttribute(this.types, 1));
+    this.geometry.setAttribute('aBirthTime', new THREE.BufferAttribute(this.birthTimes, 1));
+    this.geometry.setAttribute('aHint', new THREE.BufferAttribute(this.colorHints, 1));
   }
 
-  private addParticle(x: number, y: number, z: number, color: THREE.Color, type: number): void {
+  private addParticle(
+    x: number,
+    y: number,
+    z: number,
+    color: THREE.Color,
+    type: number,
+    birthTime: number,
+    hint: number,
+  ): void {
     if (this.pIndex >= PARTICLE_COUNT) return;
     const idx3 = this.pIndex * 3;
     this.positions[idx3] = x;
@@ -103,6 +117,8 @@ export class ParticleEnvironment {
     this.colors[idx3 + 2] = color.b;
 
     this.types[this.pIndex] = type;
+    this.birthTimes[this.pIndex] = birthTime;
+    this.colorHints[this.pIndex] = hint;
     this.pIndex++;
   }
 
@@ -114,6 +130,7 @@ export class ParticleEnvironment {
     depth: number,
     maxDepth: number,
     season: Season,
+    birthTime: number,
   ): void {
     const density = 500;
     const segmentParticles = Math.max(20, Math.floor(length * radius * density));
@@ -137,27 +154,15 @@ export class ParticleEnvironment {
       const cosT = Math.cos(theta);
       const sinT = Math.sin(theta);
 
-      const px =
-        start.x +
-        axis.x * h +
-        perp.x * radScale * cosT +
-        perp2.x * radScale * sinT;
-      const py =
-        start.y +
-        axis.y * h +
-        perp.y * radScale * cosT +
-        perp2.y * radScale * sinT;
-      const pz =
-        start.z +
-        axis.z * h +
-        perp.z * radScale * cosT +
-        perp2.z * radScale * sinT;
+      const px = start.x + axis.x * h + perp.x * radScale * cosT + perp2.x * radScale * sinT;
+      const py = start.y + axis.y * h + perp.y * radScale * cosT + perp2.y * radScale * sinT;
+      const pz = start.z + axis.z * h + perp.z * radScale * cosT + perp2.z * radScale * sinT;
 
       this._color
         .copy(WOOD_COLOR_BASE)
         .lerp(WOOD_COLOR_VAR, Math.random() * 0.8)
         .multiplyScalar(ao);
-      this.addParticle(px, py, pz, this._color, 0.0);
+      this.addParticle(px, py, pz, this._color, 0.0, birthTime, Math.random());
     }
 
     if (depth <= 3) {
@@ -182,9 +187,7 @@ export class ParticleEnvironment {
         const py = cy + (oy / olen) * dist;
         const pz = cz + (oz / olen) * dist;
 
-        const distFromCenter = dist / leafSpread;
-        const ao = 0.5 + 0.5 * distFromCenter;
-
+        const ao = 0.5 + 0.5 * (dist / leafSpread);
         const noiseVal = simpleNoise(px, py, pz);
         const paletteIndexFloat =
           noiseVal * (currentPalette.length - 1) + (Math.random() - 0.5) * 2.0;
@@ -197,7 +200,7 @@ export class ParticleEnvironment {
           .copy(currentPalette[paletteIndex])
           .offsetHSL(0, 0, (Math.random() - 0.5) * 0.1)
           .multiplyScalar(ao);
-        this.addParticle(px, py, pz, this._color, 1.0);
+        this.addParticle(px, py, pz, this._color, 1.0, birthTime, noiseVal);
       }
     }
 
@@ -220,22 +223,20 @@ export class ParticleEnvironment {
       newDir.y -= 0.08 * (maxDepth - depth) * 0.15;
       newDir.normalize();
 
-      const lenDecay = 0.75 + Math.random() * 0.15;
-      const radDecay = 0.6;
-
       this.createBranch(
         end,
         newDir,
-        length * lenDecay,
-        radius * radDecay,
+        length * (0.75 + Math.random() * 0.15),
+        radius * 0.6,
         depth - 1,
         maxDepth,
         season,
+        birthTime,
       );
     }
   }
 
-  private createPine(start: THREE.Vector3, scale: number, season: Season): void {
+  private createPine(start: THREE.Vector3, scale: number, season: Season, birthTime: number): void {
     const height = 10.0 * scale;
     const trunkRadius = 1.0 * scale;
     const trunkParticles = Math.floor(height * trunkRadius * 600);
@@ -255,6 +256,8 @@ export class ParticleEnvironment {
         start.z + r * Math.sin(theta),
         this._color,
         0.0,
+        birthTime,
+        Math.random(),
       );
     }
 
@@ -279,11 +282,11 @@ export class ParticleEnvironment {
         .multiplyScalar(ao)
         .lerp(pineTint, 0.3);
 
-      this.addParticle(px, py, pz, this._color, 1.0);
+      this.addParticle(px, py, pz, this._color, 1.0, birthTime, noiseVal);
     }
   }
 
-  private createBush(start: THREE.Vector3, scale: number, season: Season): void {
+  private createBush(start: THREE.Vector3, scale: number, season: Season, birthTime: number): void {
     const radius = 2.5 * scale;
     const leafDensity = 3000 * scale;
     const currentPalette = PALETTES[season];
@@ -301,8 +304,46 @@ export class ParticleEnvironment {
       const paletteIndex = Math.floor(noiseVal * (currentPalette.length - 1));
       this._color.copy(currentPalette[paletteIndex]).multiplyScalar(ao);
 
-      this.addParticle(px, py, pz, this._color, 1.0);
+      this.addParticle(px, py, pz, this._color, 1.0, birthTime, noiseVal);
     }
+  }
+
+  public plantTreeAt(
+    x: number,
+    z: number,
+    species: PlantSpecies,
+    scale: number,
+    roughness: number,
+    season: Season,
+    elapsedTime: number,
+  ): { ok: boolean; y: number } {
+    const py = terrainHeight(x, z, roughness);
+    if (this.pIndex > PARTICLE_COUNT - 16_000) {
+      return { ok: false, y: py };
+    }
+
+    const s = scale + (Math.random() - 0.5) * 0.2;
+    const tiltX = (Math.random() - 0.5) * 0.2;
+    const tiltZ = (Math.random() - 0.5) * 0.2;
+    const dir = new THREE.Vector3(tiltX, 1, tiltZ).normalize();
+    const origin = new THREE.Vector3(x, py, z);
+
+    if (species === 'Oak') {
+      this.createBranch(origin, dir, 5.0 * s, 1.6 * s, 6, 6, season, elapsedTime);
+    } else if (species === 'Pine') {
+      this.createPine(origin, s, season, elapsedTime);
+    } else {
+      this.createBush(origin, s, season, elapsedTime);
+    }
+
+    this.geometry.setDrawRange(0, this.pIndex);
+    (this.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (this.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
+    (this.geometry.attributes.type as THREE.BufferAttribute).needsUpdate = true;
+    (this.geometry.attributes.aBirthTime as THREE.BufferAttribute).needsUpdate = true;
+    (this.geometry.attributes.aHint as THREE.BufferAttribute).needsUpdate = true;
+
+    return { ok: true, y: py };
   }
 
   public generate(params: SimulationParams, markUpdate: boolean): void {
@@ -314,15 +355,8 @@ export class ParticleEnvironment {
     const colorRock = new THREE.Color(0x7a8789);
     const waterBase = new THREE.Color(0x1c3d4d);
     const waterHigh = new THREE.Color(0x2a5a6b);
-
-    let colorMoss = new THREE.Color(0x4a5d4e);
-    let colorHigh = new THREE.Color(0x5c6b6d);
-    if (params.season === 'winter') {
-      colorMoss = new THREE.Color(0xdce2e6);
-      colorHigh = new THREE.Color(0xeef2f5);
-    } else if (params.season === 'spring') {
-      colorMoss = new THREE.Color(0x5c7a62);
-    }
+    const colorMoss = new THREE.Color(0x4a5d4e);
+    const colorHigh = new THREE.Color(0x5c6b6d);
 
     for (let i = 0; i < terrainParticles; i++) {
       const px = (Math.random() - 0.5) * TERRAIN_SIZE;
@@ -341,7 +375,7 @@ export class ParticleEnvironment {
         if (py < waterLevel + 0.5) {
           this._color.copy(waterBase).lerp(waterHigh, Math.random());
           const waterY = waterLevel + (Math.random() - 0.5) * 0.2;
-          this.addParticle(px, waterY, pz, this._color, 3.0);
+          this.addParticle(px, waterY, pz, this._color, 3.0, -10.0, Math.random());
         }
       } else {
         const moisture = 1.0 - smoothstep(riverWidth, riverWidth + 10.0, distToRiver);
@@ -354,11 +388,13 @@ export class ParticleEnvironment {
 
         const ao = 0.2 + 0.8 * (1.0 - depth / 3.0);
         this._color.multiplyScalar(ao);
-        this.addParticle(px, py, pz, this._color, 2.0);
+        // Hint stores normalized height/moisture factor for winter frost/snow morphing
+        const snowAffinity = clamp01(smoothstep(-2.0, 4.0, baseHeight) * 0.6 + moisture * 0.4);
+        this.addParticle(px, py, pz, this._color, 2.0, -10.0, snowAffinity);
       }
     }
 
-    // 2. Forest Trees
+    // 2. Forest Trees (generated in base autumn palette; shader smoothly morphs seasons!)
     for (let i = 0; i < params.treeDensity; i++) {
       let tx = 0;
       let tz = 0;
@@ -386,11 +422,11 @@ export class ParticleEnvironment {
         const origin = new THREE.Vector3(tx, py, tz);
 
         if (params.plantType === 'Oak') {
-          this.createBranch(origin, dir, 5.0 * scale, 1.6 * scale, 6, 6, params.season);
+          this.createBranch(origin, dir, 5.0 * scale, 1.6 * scale, 6, 6, 'autumn', -10.0);
         } else if (params.plantType === 'Pine') {
-          this.createPine(origin, scale, params.season);
+          this.createPine(origin, scale, 'autumn', -10.0);
         } else {
-          this.createBush(origin, scale, params.season);
+          this.createBush(origin, scale, 'autumn', -10.0);
         }
       }
     }
@@ -400,10 +436,16 @@ export class ParticleEnvironment {
       (this.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
       (this.geometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
       (this.geometry.attributes.type as THREE.BufferAttribute).needsUpdate = true;
+      (this.geometry.attributes.aBirthTime as THREE.BufferAttribute).needsUpdate = true;
+      (this.geometry.attributes.aHint as THREE.BufferAttribute).needsUpdate = true;
     }
   }
 
   public dispose(): void {
     this.geometry.dispose();
   }
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
 }

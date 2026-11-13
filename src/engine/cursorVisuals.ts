@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { InteractionContext, InteractionMode } from '../types/simulation';
+import { InteractionContext, InteractionMode, ModeType } from '../types/simulation';
 
 const CONTEXT_COLORS: Record<InteractionContext, THREE.Color> = {
   All: new THREE.Color(0xdbeafe), // Alabaster / Pale ice
@@ -7,6 +7,8 @@ const CONTEXT_COLORS: Record<InteractionContext, THREE.Color> = {
   'Water Only': new THREE.Color(0x38bdf8), // Fjord cyan
   'Ground Only': new THREE.Color(0xf59e0b), // Mineral amber
 };
+
+const PLANT_COLOR = new THREE.Color(0x86efac); // Fresh birch-sapling emerald
 
 const RING_VERTEX = /* glsl */ `
   varying vec2 vUv;
@@ -22,6 +24,7 @@ const RING_FRAGMENT = /* glsl */ `
   uniform float uEnergy;
   uniform float uOpacity;
   uniform float uModeId;
+  uniform float uIsPlantMode;
 
   varying vec2 vUv;
 
@@ -32,21 +35,28 @@ const RING_FRAGMENT = /* glsl */ `
 
     float angle = atan(p.y, p.x);
 
-    // Outer thin precision boundary
+    // Outer precision reticle boundary
     float outerRing = smoothstep(0.035, 0.0, abs(r - 0.92));
 
-    // Inner contextual cadence ring (dashed/segmented depending on mode)
-    float segCount = (abs(uModeId - 3.0) < 0.25) ? 6.0 : (abs(uModeId - 4.0) < 0.25 ? 12.0 : 4.0);
+    // Plant mode shows an 8-notch botanical placement reticle; Explore mode adapts per physics mode
+    float segCount = uIsPlantMode > 0.5
+      ? 8.0
+      : (abs(uModeId - 3.0) < 0.25 ? 6.0 : (abs(uModeId - 4.0) < 0.25 ? 12.0 : 4.0));
     float segMask = smoothstep(-0.2, 0.35, sin(angle * segCount + uTime * (1.2 + uEnergy * 2.0)));
     float innerRing = smoothstep(0.025, 0.0, abs(r - 0.56)) * mix(0.35, 1.0, segMask);
 
-    // Center focal dot
-    float centerDot = smoothstep(0.09, 0.03, r);
+    // Plant mode inner crosshair ticks
+    float crossMask = 0.0;
+    if (uIsPlantMode > 0.5) {
+      float crossBand = step(0.18, r) * step(r, 0.42);
+      float axis = min(abs(p.x), abs(p.y));
+      crossMask = smoothstep(0.028, 0.0, axis) * crossBand;
+    }
 
-    // Soft field glow inside radius
+    float centerDot = smoothstep(0.09, 0.03, r);
     float radialGlow = exp(-r * r * 3.8) * (0.14 + uEnergy * 0.22);
 
-    float alpha = (outerRing * 0.85 + innerRing * 0.65 + centerDot * 0.9 + radialGlow) * uOpacity;
+    float alpha = (outerRing * 0.85 + innerRing * 0.65 + crossMask * 0.85 + centerDot * 0.9 + radialGlow) * uOpacity;
     if (alpha < 0.005) discard;
 
     gl_FragColor = vec4(uColor * (1.0 + uEnergy * 0.55), clamp(alpha, 0.0, 0.95));
@@ -81,9 +91,8 @@ const TRAIL_FRAGMENT = /* glsl */ `
 
 const TRAIL_LENGTH = 56;
 
-export class ContextCursorVisuals {
+class CursorInstance {
   public readonly group = new THREE.Group();
-
   private readonly ringMesh: THREE.Mesh;
   private readonly ringMaterial: THREE.ShaderMaterial;
 
@@ -98,7 +107,9 @@ export class ContextCursorVisuals {
   private readonly currentColor = new THREE.Color(0xdbeafe);
   private readonly _lastDropPos = new THREE.Vector3(999, 999, 999);
 
-  constructor() {
+  constructor(initialColorHex: number) {
+    this.currentColor.setHex(initialColorHex);
+
     const planeGeo = new THREE.PlaneGeometry(2, 2);
     this.ringMaterial = new THREE.ShaderMaterial({
       uniforms: {
@@ -107,6 +118,7 @@ export class ContextCursorVisuals {
         uEnergy: { value: 0 },
         uOpacity: { value: 0 },
         uModeId: { value: 3 },
+        uIsPlantMode: { value: 0 },
       },
       vertexShader: RING_VERTEX,
       fragmentShader: RING_FRAGMENT,
@@ -158,10 +170,17 @@ export class ContextCursorVisuals {
     radius: number,
     speed: number,
     context: InteractionContext,
-    mode: InteractionMode,
+    physicsMode: InteractionMode,
+    appMode: ModeType,
     active: boolean,
+    secondaryTint = false,
   ): void {
-    const targetColor = CONTEXT_COLORS[context];
+    const targetColor =
+      appMode === 'plant'
+        ? PLANT_COLOR
+        : secondaryTint
+          ? new THREE.Color(0x67e8f9)
+          : CONTEXT_COLORS[context];
     this.currentColor.lerp(targetColor, Math.min(1, dt * 8.0));
 
     const modeMap: Record<InteractionMode, number> = {
@@ -174,7 +193,7 @@ export class ContextCursorVisuals {
     };
 
     const clampedEnergy = THREE.MathUtils.clamp(speed * 0.08, 0, 1);
-    const targetOpacity = active ? 0.88 : 0.0;
+    const targetOpacity = active ? 0.9 : 0.0;
     const currentOpacity = THREE.MathUtils.damp(
       this.ringMaterial.uniforms.uOpacity.value as number,
       targetOpacity,
@@ -186,31 +205,34 @@ export class ContextCursorVisuals {
       this.ringMesh.position.copy(worldPos);
     }
 
-    // Ground Only / Water Only align ring flat along XZ terrain; All / Trees Only face camera gently
-    if (context === 'Ground Only' || context === 'Water Only' || mode === 'Seismic Ripple') {
+    if (
+      appMode === 'plant' ||
+      context === 'Ground Only' ||
+      context === 'Water Only' ||
+      physicsMode === 'Seismic Ripple'
+    ) {
       this.ringMesh.rotation.set(-Math.PI / 2, 0, 0);
     } else {
       this.ringMesh.quaternion.copy(camera.quaternion);
     }
 
-    const scale = Math.max(0.8, radius * 0.42);
+    const scale = appMode === 'plant' ? 1.8 : Math.max(0.8, radius * 0.42);
     this.ringMesh.scale.setScalar(scale);
 
     this.ringMaterial.uniforms.uTime.value = elapsedTime;
     this.ringMaterial.uniforms.uEnergy.value = clampedEnergy;
     this.ringMaterial.uniforms.uOpacity.value = currentOpacity;
-    this.ringMaterial.uniforms.uModeId.value = modeMap[mode];
+    this.ringMaterial.uniforms.uModeId.value = modeMap[physicsMode];
+    this.ringMaterial.uniforms.uIsPlantMode.value = appMode === 'plant' ? 1.0 : 0.0;
 
-    // Decay all trail points
     for (let i = 0; i < TRAIL_LENGTH; i++) {
       if (this.trailLives[i] > 0) {
         this.trailLives[i] = Math.max(0, this.trailLives[i] - dt * 0.95);
       }
     }
 
-    // Emit new trail node when cursor moves or pulses
     this.trailTimer += dt;
-    if (active && worldPos.x < 900) {
+    if (active && appMode !== 'plant' && worldPos.x < 900) {
       const movedDist = worldPos.distanceTo(this._lastDropPos);
       if (movedDist > 0.25 || this.trailTimer > 0.035) {
         const idx = this.trailHead;
@@ -234,5 +256,65 @@ export class ContextCursorVisuals {
     this.ringMaterial.dispose();
     this.trailGeometry.dispose();
     this.trailMaterial.dispose();
+  }
+}
+
+export class ContextCursorVisuals {
+  public readonly group = new THREE.Group();
+  private readonly primary = new CursorInstance(0xdbeafe);
+  private readonly secondary = new CursorInstance(0x67e8f9);
+
+  constructor() {
+    this.group.add(this.primary.group);
+    this.group.add(this.secondary.group);
+  }
+
+  public update(
+    dt: number,
+    elapsedTime: number,
+    worldPos: THREE.Vector3,
+    camera: THREE.Camera,
+    radius: number,
+    speed: number,
+    context: InteractionContext,
+    physicsMode: InteractionMode,
+    appMode: ModeType,
+    active: boolean,
+    worldPos2?: THREE.Vector3,
+    speed2 = 0,
+    active2 = false,
+  ): void {
+    this.primary.update(
+      dt,
+      elapsedTime,
+      worldPos,
+      camera,
+      radius,
+      speed,
+      context,
+      physicsMode,
+      appMode,
+      active,
+      false,
+    );
+
+    this.secondary.update(
+      dt,
+      elapsedTime,
+      worldPos2 ?? worldPos,
+      camera,
+      radius * 0.9,
+      speed2,
+      context,
+      physicsMode,
+      appMode,
+      active2 && appMode !== 'plant',
+      true,
+    );
+  }
+
+  public dispose(): void {
+    this.primary.dispose();
+    this.secondary.dispose();
   }
 }

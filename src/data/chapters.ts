@@ -14,6 +14,11 @@ export const EXHIBITION_CHAPTERS: ChapterDefinition[] = [
     fogDensity: 0.018,
     sunElevation: 0.3,
     bloomStrength: 0.9,
+    cameraTarget: {
+      theta: Math.PI * 0.5,
+      phi: Math.PI * 0.33,
+      radius: 37,
+    },
   },
   {
     id: 1,
@@ -27,21 +32,31 @@ export const EXHIBITION_CHAPTERS: ChapterDefinition[] = [
     windStrength: 0.5,
     fogDensity: 0.012,
     sunElevation: 0.8,
-    bloomStrength: 1.15,
+    bloomStrength: 1.1,
+    cameraTarget: {
+      theta: Math.PI * 0.72,
+      phi: Math.PI * 0.28,
+      radius: 31,
+    },
   },
   {
     id: 2,
     shortLabel: '03 Aurora',
     accessionCode: 'Plate III · Geomagnetic Lift',
     title: 'Magnetic Skies',
-    desc: 'High-altitude particles respond to localized electromagnetic lift and azimuthal curl, illuminating winter birch silhouettes with luminous aurora ribbons.',
+    desc: 'High-altitude particles respond to localized electromagnetic lift and azimuthal curl, illuminating winter birch silhouettes and glowing sap veins with aurora ribbons.',
     interactionMode: 'Aurora Field',
     interactionContext: 'All',
     season: 'winter',
     windStrength: 0.25,
-    fogDensity: 0.024,
+    fogDensity: 0.022,
     sunElevation: -0.2,
-    bloomStrength: 1.35,
+    bloomStrength: 1.3,
+    cameraTarget: {
+      theta: Math.PI * 1.15,
+      phi: Math.PI * 0.41,
+      radius: 34,
+    },
   },
   {
     id: 3,
@@ -54,8 +69,13 @@ export const EXHIBITION_CHAPTERS: ChapterDefinition[] = [
     season: 'autumn',
     windStrength: 0.0,
     fogDensity: 0.015,
-    sunElevation: 0.12,
-    bloomStrength: 1.0,
+    sunElevation: 0.14,
+    bloomStrength: 0.95,
+    cameraTarget: {
+      theta: Math.PI * 1.55,
+      phi: Math.PI * 0.24,
+      radius: 41,
+    },
   },
 ];
 
@@ -66,11 +86,10 @@ export const EXHIBITION_CHAPTERS: ChapterDefinition[] = [
 export function createSampleNatureRecording(): SensorRecording {
   const samples: SensorSample[] = [];
   const durationMs = 18000;
-  const stepMs = 50; // 20 Hz sensor log
+  const stepMs = 50;
 
   for (let t = 0; t <= durationMs; t += stepMs) {
     const sec = t / 1000;
-    // Coupled harmonic sway + turbulent wind burst envelope
     const gustEnvelope =
       0.5 + 0.5 * Math.sin(sec * 0.55 - 0.8) * Math.cos(sec * 0.23);
     const rawX =
