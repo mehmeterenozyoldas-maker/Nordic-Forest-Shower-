@@ -17,6 +17,7 @@ export type InteractionContext = 'All' | 'Trees Only' | 'Water Only' | 'Ground O
 export type InputSourceType = 'pointer' | 'hands' | 'ble' | 'websocket' | 'playback' | 'webxr';
 
 export interface SimulationParams {
+  terrainSeed: number;
   mode: ModeType;
   season: Season;
   riverWidth: number;
@@ -36,6 +37,12 @@ export interface SimulationParams {
   bloomStrength: number;
 }
 
+export interface CameraTarget {
+  theta: number;
+  phi: number;
+  radius: number;
+}
+
 export interface ChapterDefinition {
   id: number;
   shortLabel: string;
@@ -49,11 +56,128 @@ export interface ChapterDefinition {
   fogDensity: number;
   sunElevation: number;
   bloomStrength: number;
-  cameraTarget: {
-    theta: number;
-    phi: number;
-    radius: number;
-  };
+  cameraTarget: CameraTarget;
+}
+
+export interface SavedPlantedTree {
+  id: string;
+  x: number;
+  z: number;
+  species: PlantSpecies;
+  scale: number;
+  plantedAt: number;
+}
+
+export interface TerrainConfig {
+  seed: number;
+  riverWidth: number;
+  terrainRoughness: number;
+  treeDensity: number;
+  treeScale: number;
+  baseSpecies: PlantSpecies;
+}
+
+export interface AtmosphereSnapshot {
+  season: Season;
+  sunElevation: number;
+  sunAzimuth: number;
+  fogDensity: number;
+  bloomStrength: number;
+  windStrength: number;
+  windDirection: number;
+  interactionMode: InteractionMode;
+  interactionContext: InteractionContext;
+}
+
+export interface ForestPlate {
+  id: string;
+  accessionCode: string;
+  curatorId: string;
+  authorName: string;
+  title: string;
+  notes: string;
+  visibility: 'public' | 'unlisted';
+  terrainConfig: TerrainConfig;
+  atmosphere: AtmosphereSnapshot;
+  cameraTarget: CameraTarget;
+  plantedTrees: SavedPlantedTree[];
+  thumbnailDataUrl: string | null;
+  likesCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AtmospherePreset {
+  id: string;
+  curatorId: string;
+  authorName: string;
+  name: string;
+  isPublic: boolean;
+  atmosphere: AtmosphereSnapshot;
+  cameraTarget: CameraTarget;
+  createdAt: string;
+}
+
+export interface CuratorProfile {
+  id: string;
+  handle: string;
+  displayName: string;
+  createdAt: string;
+}
+
+export interface WeatherStation {
+  id: string;
+  name: string;
+  region: string;
+  latitude: number;
+  longitude: number;
+}
+
+export interface WeatherObservation {
+  latitude: number;
+  longitude: number;
+  temperatureC: number;
+  windSpeedKmh: number;
+  windDirectionDeg: number;
+  cloudCoverPct: number;
+  precipitationMm: number;
+  weatherCode: number;
+  conditionLabel: string;
+  observedAt: string;
+  fallback: boolean;
+}
+
+export interface WeatherSyncState {
+  enabled: boolean;
+  loading: boolean;
+  stationId: string;
+  stationName: string;
+  solarElevationDeg: number;
+  observation: WeatherObservation | null;
+  error: string | null;
+}
+
+export interface CollabVisitor {
+  clientId: string;
+  name: string;
+  color: string;
+}
+
+export interface CollabState {
+  status: 'disconnected' | 'connecting' | 'connected' | 'error';
+  roomId: string;
+  selfId: string;
+  selfName: string;
+  selfColor: string;
+  visitors: CollabVisitor[];
+  error: string | null;
+}
+
+export interface KioskState {
+  enabled: boolean;
+  intervalSec: number;
+  plateIndex: number;
+  plateTotal: number;
 }
 
 export interface SensorSample {
@@ -128,8 +252,19 @@ export interface SimulationHUDState {
   plantType: PlantSpecies;
   plantedCount: number;
   chapterIndex: number;
+  activePlateTitle: string | null;
+  activePlateAuthor: string | null;
+  activePlateAccession: string | null;
+  season: Season;
+  sunElevation: number;
+  sunAzimuth: number;
+  fogDensity: number;
+  bloomStrength: number;
+  windStrength: number;
+  windDirection: number;
   interactionMode: InteractionMode;
   interactionContext: InteractionContext;
+  interactionRadius: number;
   activeSource: InputSourceType;
   secondaryCursorActive: boolean;
   attractMode: boolean;
@@ -137,13 +272,14 @@ export interface SimulationHUDState {
   audioMuted: boolean;
   cursorNdc: { x: number; y: number };
   cursorSpeed: number;
-  windStrength: number;
-  interactionRadius: number;
   handTracking: HandTrackingState;
   hardware: HardwareConnectionState;
   playback: PlaybackStatus;
   recording: RecordingStatus;
   webxr: WebXRState;
+  weather: WeatherSyncState;
+  collab: CollabState;
+  kiosk: KioskState;
   webglLost: boolean;
   isSoftwareGl: boolean;
 }

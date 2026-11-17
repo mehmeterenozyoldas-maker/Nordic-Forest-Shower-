@@ -1,14 +1,15 @@
 import * as THREE from 'three';
+import { RemoteVisitorCursor } from '../inputs/collabClient';
 import { InteractionContext, InteractionMode, ModeType } from '../types/simulation';
 
 const CONTEXT_COLORS: Record<InteractionContext, THREE.Color> = {
-  All: new THREE.Color(0xdbeafe), // Alabaster / Pale ice
-  'Trees Only': new THREE.Color(0x4ade80), // Botanical emerald
-  'Water Only': new THREE.Color(0x38bdf8), // Fjord cyan
-  'Ground Only': new THREE.Color(0xf59e0b), // Mineral amber
+  All: new THREE.Color(0xdbeafe),
+  'Trees Only': new THREE.Color(0x4ade80),
+  'Water Only': new THREE.Color(0x38bdf8),
+  'Ground Only': new THREE.Color(0xf59e0b),
 };
 
-const PLANT_COLOR = new THREE.Color(0x86efac); // Fresh birch-sapling emerald
+const PLANT_COLOR = new THREE.Color(0x86efac);
 
 const RING_VERTEX = /* glsl */ `
   varying vec2 vUv;
@@ -19,6 +20,7 @@ const RING_VERTEX = /* glsl */ `
 `;
 
 const RING_FRAGMENT = /* glsl */ `
+  precision mediump float;
   uniform vec3 uColor;
   uniform float uTime;
   uniform float uEnergy;
@@ -35,17 +37,14 @@ const RING_FRAGMENT = /* glsl */ `
 
     float angle = atan(p.y, p.x);
 
-    // Outer precision reticle boundary
     float outerRing = smoothstep(0.035, 0.0, abs(r - 0.92));
 
-    // Plant mode shows an 8-notch botanical placement reticle; Explore mode adapts per physics mode
     float segCount = uIsPlantMode > 0.5
       ? 8.0
       : (abs(uModeId - 3.0) < 0.25 ? 6.0 : (abs(uModeId - 4.0) < 0.25 ? 12.0 : 4.0));
     float segMask = smoothstep(-0.2, 0.35, sin(angle * segCount + uTime * (1.2 + uEnergy * 2.0)));
     float innerRing = smoothstep(0.025, 0.0, abs(r - 0.56)) * mix(0.35, 1.0, segMask);
 
-    // Plant mode inner crosshair ticks
     float crossMask = 0.0;
     if (uIsPlantMode > 0.5) {
       float crossBand = step(0.18, r) * step(r, 0.42);
@@ -66,17 +65,19 @@ const RING_FRAGMENT = /* glsl */ `
 const TRAIL_VERTEX = /* glsl */ `
   attribute float aLife;
   uniform float uSize;
+  uniform float uPointScale;
   varying float vLife;
 
   void main() {
     vLife = aLife;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mvPosition;
-    gl_PointSize = uSize * aLife * (24.0 / max(1.0, -mvPosition.z));
+    gl_PointSize = clamp(uSize * aLife * uPointScale * (24.0 / max(1.0, -mvPosition.z)), 1.0, 24.0);
   }
 `;
 
 const TRAIL_FRAGMENT = /* glsl */ `
+  precision mediump float;
   uniform vec3 uColor;
   varying float vLife;
 
@@ -89,7 +90,17 @@ const TRAIL_FRAGMENT = /* glsl */ `
   }
 `;
 
-const TRAIL_LENGTH = 56;
+const TRAIL_LENGTH = 48;
+const REMOTE_POOL_SIZE = 6;
+
+const MODE_MAP: Record<InteractionMode, number> = {
+  'Wind Gust': 0,
+  Tornado: 1,
+  Parting: 2,
+  'Fluid Push/Pull': 3,
+  'Seismic Ripple': 4,
+  'Aurora Field': 5,
+};
 
 class CursorInstance {
   public readonly group = new THREE.Group();
@@ -103,11 +114,12 @@ class CursorInstance {
   private readonly trailLives = new Float32Array(TRAIL_LENGTH);
   private trailHead = 0;
   private trailTimer = 0;
+  private hasAliveTrail = false;
 
   private readonly currentColor = new THREE.Color(0xdbeafe);
   private readonly _lastDropPos = new THREE.Vector3(999, 999, 999);
 
-  constructor(initialColorHex: number) {
+  constructor(initialColorHex: number, pointScale = 1.0) {
     this.currentColor.setHex(initialColorHex);
 
     const planeGeo = new THREE.PlaneGeometry(2, 2);
@@ -124,7 +136,10 @@ class CursorInstance {
       fragmentShader: RING_FRAGMENT,
       transparent: true,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
       blending: THREE.AdditiveBlending,
       side: THREE.DoubleSide,
     });
@@ -146,6 +161,7 @@ class CursorInstance {
       uniforms: {
         uColor: { value: this.currentColor },
         uSize: { value: 14.0 },
+        uPointScale: { value: pointScale },
       },
       vertexShader: TRAIL_VERTEX,
       fragmentShader: TRAIL_FRAGMENT,
@@ -160,39 +176,26 @@ class CursorInstance {
 
     this.group.add(this.ringMesh);
     this.group.add(this.trailPoints);
+    this.group.visible = false;
+  }
+
+  public setPointScale(scale: number): void {
+    this.trailMaterial.uniforms.uPointScale.value = scale;
   }
 
   public update(
     dt: number,
     elapsedTime: number,
     worldPos: THREE.Vector3,
-    camera: THREE.Camera,
+    camWorldQuat: THREE.Quaternion,
     radius: number,
     speed: number,
     context: InteractionContext,
     physicsMode: InteractionMode,
     appMode: ModeType,
     active: boolean,
-    secondaryTint = false,
+    customColor?: THREE.Color,
   ): void {
-    const targetColor =
-      appMode === 'plant'
-        ? PLANT_COLOR
-        : secondaryTint
-          ? new THREE.Color(0x67e8f9)
-          : CONTEXT_COLORS[context];
-    this.currentColor.lerp(targetColor, Math.min(1, dt * 8.0));
-
-    const modeMap: Record<InteractionMode, number> = {
-      'Wind Gust': 0,
-      Tornado: 1,
-      Parting: 2,
-      'Fluid Push/Pull': 3,
-      'Seismic Ripple': 4,
-      'Aurora Field': 5,
-    };
-
-    const clampedEnergy = THREE.MathUtils.clamp(speed * 0.08, 0, 1);
     const targetOpacity = active ? 0.9 : 0.0;
     const currentOpacity = THREE.MathUtils.damp(
       this.ringMaterial.uniforms.uOpacity.value as number,
@@ -201,19 +204,40 @@ class CursorInstance {
       dt,
     );
 
-    if (active && worldPos.x < 900) {
-      this.ringMesh.position.copy(worldPos);
+    if (!active && currentOpacity < 0.004 && !this.hasAliveTrail) {
+      this.ringMaterial.uniforms.uOpacity.value = 0;
+      this.group.visible = false;
+      return;
     }
 
-    if (
+    this.group.visible = true;
+
+    const targetColor = customColor
+      ? customColor
+      : appMode === 'plant'
+        ? PLANT_COLOR
+        : CONTEXT_COLORS[context];
+    this.currentColor.lerp(targetColor, Math.min(1, dt * 8.0));
+
+    const clampedEnergy = THREE.MathUtils.clamp(speed * 0.08, 0, 1);
+
+    const groundLocked =
       appMode === 'plant' ||
       context === 'Ground Only' ||
       context === 'Water Only' ||
-      physicsMode === 'Seismic Ripple'
-    ) {
+      physicsMode === 'Seismic Ripple';
+
+    if (active && worldPos.x < 900) {
+      this.ringMesh.position.copy(worldPos);
+      if (groundLocked) {
+        this.ringMesh.position.y += 0.16;
+      }
+    }
+
+    if (groundLocked) {
       this.ringMesh.rotation.set(-Math.PI / 2, 0, 0);
     } else {
-      this.ringMesh.quaternion.copy(camera.quaternion);
+      this.ringMesh.quaternion.copy(camWorldQuat);
     }
 
     const scale = appMode === 'plant' ? 1.8 : Math.max(0.8, radius * 0.42);
@@ -222,12 +246,14 @@ class CursorInstance {
     this.ringMaterial.uniforms.uTime.value = elapsedTime;
     this.ringMaterial.uniforms.uEnergy.value = clampedEnergy;
     this.ringMaterial.uniforms.uOpacity.value = currentOpacity;
-    this.ringMaterial.uniforms.uModeId.value = modeMap[physicsMode];
+    this.ringMaterial.uniforms.uModeId.value = MODE_MAP[physicsMode];
     this.ringMaterial.uniforms.uIsPlantMode.value = appMode === 'plant' ? 1.0 : 0.0;
 
+    let anyTrailAlive = false;
     for (let i = 0; i < TRAIL_LENGTH; i++) {
       if (this.trailLives[i] > 0) {
         this.trailLives[i] = Math.max(0, this.trailLives[i] - dt * 0.95);
+        if (this.trailLives[i] > 0) anyTrailAlive = true;
       }
     }
 
@@ -240,6 +266,7 @@ class CursorInstance {
         this.trailPositions[idx * 3 + 1] = worldPos.y;
         this.trailPositions[idx * 3 + 2] = worldPos.z;
         this.trailLives[idx] = 1.0;
+        anyTrailAlive = true;
 
         this.trailHead = (this.trailHead + 1) % TRAIL_LENGTH;
         this._lastDropPos.copy(worldPos);
@@ -247,8 +274,11 @@ class CursorInstance {
       }
     }
 
-    (this.trailGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-    (this.trailGeometry.attributes.aLife as THREE.BufferAttribute).needsUpdate = true;
+    if (anyTrailAlive || this.hasAliveTrail) {
+      (this.trailGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      (this.trailGeometry.attributes.aLife as THREE.BufferAttribute).needsUpdate = true;
+    }
+    this.hasAliveTrail = anyTrailAlive;
   }
 
   public dispose(): void {
@@ -261,12 +291,29 @@ class CursorInstance {
 
 export class ContextCursorVisuals {
   public readonly group = new THREE.Group();
-  private readonly primary = new CursorInstance(0xdbeafe);
-  private readonly secondary = new CursorInstance(0x67e8f9);
+  private readonly primary: CursorInstance;
+  private readonly secondary: CursorInstance;
+  private readonly remotePool: CursorInstance[] = [];
+  private readonly _secondaryTint = new THREE.Color(0x67e8f9);
+  private readonly _idlePos = new THREE.Vector3(999, 999, 999);
+  private readonly _camWorldQuat = new THREE.Quaternion();
 
-  constructor() {
+  constructor(pointScale = 1.0) {
+    this.primary = new CursorInstance(0xdbeafe, pointScale);
+    this.secondary = new CursorInstance(0x67e8f9, pointScale);
     this.group.add(this.primary.group);
     this.group.add(this.secondary.group);
+    for (let i = 0; i < REMOTE_POOL_SIZE; i++) {
+      const inst = new CursorInstance(0xfcd34d, pointScale);
+      this.remotePool.push(inst);
+      this.group.add(inst.group);
+    }
+  }
+
+  public setPointScale(scale: number): void {
+    this.primary.setPointScale(scale);
+    this.secondary.setPointScale(scale);
+    for (const rc of this.remotePool) rc.setPointScale(scale);
   }
 
   public update(
@@ -283,38 +330,78 @@ export class ContextCursorVisuals {
     worldPos2?: THREE.Vector3,
     speed2 = 0,
     active2 = false,
+    remoteCursors?: IterableIterator<RemoteVisitorCursor>,
   ): void {
+    camera.getWorldQuaternion(this._camWorldQuat);
+
     this.primary.update(
       dt,
       elapsedTime,
       worldPos,
-      camera,
+      this._camWorldQuat,
       radius,
       speed,
       context,
       physicsMode,
       appMode,
       active,
-      false,
     );
 
     this.secondary.update(
       dt,
       elapsedTime,
       worldPos2 ?? worldPos,
-      camera,
+      this._camWorldQuat,
       radius * 0.9,
       speed2,
       context,
       physicsMode,
       appMode,
       active2 && appMode !== 'plant',
-      true,
+      this._secondaryTint,
     );
+
+    let rIdx = 0;
+    if (remoteCursors) {
+      for (const rc of remoteCursors) {
+        if (rIdx >= REMOTE_POOL_SIZE) break;
+        const velMag = rc.velocity.length();
+        this.remotePool[rIdx].update(
+          dt,
+          elapsedTime,
+          rc.worldPos,
+          this._camWorldQuat,
+          radius * 0.85,
+          velMag,
+          context,
+          physicsMode,
+          'explore',
+          rc.active,
+          rc.color,
+        );
+        rIdx++;
+      }
+    }
+    while (rIdx < REMOTE_POOL_SIZE) {
+      this.remotePool[rIdx].update(
+        dt,
+        elapsedTime,
+        this._idlePos,
+        this._camWorldQuat,
+        radius * 0.85,
+        0,
+        context,
+        physicsMode,
+        'explore',
+        false,
+      );
+      rIdx++;
+    }
   }
 
   public dispose(): void {
     this.primary.dispose();
     this.secondary.dispose();
+    for (const rc of this.remotePool) rc.dispose();
   }
 }

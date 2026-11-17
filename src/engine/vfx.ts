@@ -1,8 +1,5 @@
 import * as THREE from 'three';
 
-const AMBIENT_COUNT = 6_000;
-const BURST_CAPACITY = 4_000;
-
 const AMBIENT_VERTEX = /* glsl */ `
   attribute float aSeed;
   attribute float aSize;
@@ -12,6 +9,7 @@ const AMBIENT_VERTEX = /* glsl */ `
   uniform vec3 uWindDir;
   uniform vec3 uSeasonWeights; // (autumn, spring, winter)
   uniform sampler2D uWakeTex;
+  uniform float uPointScale;
 
   varying float vSeed;
   varying float vGlow;
@@ -20,22 +18,18 @@ const AMBIENT_VERTEX = /* glsl */ `
     vSeed = aSeed;
     vec3 pos = position;
 
-    // Wind + seasonal drift
     float driftSpeed = mix(0.6, 1.35, uSeasonWeights.z) * (0.4 + uWindStrength * 0.45);
     pos.x = mod(pos.x + uWindDir.x * uTime * driftSpeed * 2.2 + 35.0, 70.0) - 35.0;
     pos.z = mod(pos.z + uWindDir.z * uTime * driftSpeed * 2.2 + 35.0, 70.0) - 35.0;
 
-    // Snow falls gently downward; spores & fireflies bob smoothly
     float fallRate = uSeasonWeights.z * 2.1;
     float bobAmp = mix(0.65, 1.35, uSeasonWeights.y);
     float rawY = pos.y - uTime * fallRate + sin(uTime * 1.4 + aSeed * 25.0) * bobAmp;
     pos.y = mod(rawY + 4.0, 24.0) - 4.0;
 
-    // Lateral spiral turbulence
     pos.x += sin(uTime * 0.9 + aSeed * 19.0) * (0.5 + uSeasonWeights.y * 0.8);
     pos.z += cos(uTime * 0.85 + aSeed * 23.0) * (0.5 + uSeasonWeights.y * 0.8);
 
-    // Couple to persistent GPU fluid wake field
     vec2 wakeUv = clamp((pos.xz / 70.0) + 0.5, vec2(0.002), vec2(0.998));
     vec4 wake = texture2D(uWakeTex, wakeUv);
     vec2 wakeVel = (wake.rg - 0.5) * 2.0;
@@ -43,19 +37,19 @@ const AMBIENT_VERTEX = /* glsl */ `
     pos.xz += wakeVel * wakeEnergy * 2.8;
     pos.y += wakeEnergy * 1.8;
 
-    // Firefly twinkle in spring, crisp shimmer in winter snow
     float pulse = 0.5 + 0.5 * sin(uTime * mix(2.2, 5.5, uSeasonWeights.y) + aSeed * 62.8);
     vGlow = mix(0.45 + 0.55 * pulse, 0.75 + 0.25 * pulse, uSeasonWeights.z) + wakeEnergy * 0.6;
 
     vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
-    float seasonalSize = aSize * mix(1.0, 1.3, uSeasonWeights.y + uSeasonWeights.z * 0.5);
-    gl_PointSize = seasonalSize * (22.0 / max(1.0, -mvPosition.z));
+    float seasonalSize = aSize * mix(1.0, 1.3, uSeasonWeights.y + uSeasonWeights.z * 0.5) * uPointScale;
+    gl_PointSize = clamp(seasonalSize * (22.0 / max(1.0, -mvPosition.z)), 1.5, 24.0);
   }
 `;
 
 const AMBIENT_FRAGMENT = /* glsl */ `
-  uniform vec3 uSeasonWeights;
+  precision mediump float;
+  uniform highp vec3 uSeasonWeights;
   varying float vSeed;
   varying float vGlow;
 
@@ -83,12 +77,12 @@ export class AmbientAtmosphereSystem {
   private readonly geometry: THREE.BufferGeometry;
   private readonly material: THREE.ShaderMaterial;
 
-  constructor(wakeTexture: THREE.Texture) {
-    const positions = new Float32Array(AMBIENT_COUNT * 3);
-    const seeds = new Float32Array(AMBIENT_COUNT);
-    const sizes = new Float32Array(AMBIENT_COUNT);
+  constructor(wakeTexture: THREE.Texture, count = 3_200, pointScale = 1.0) {
+    const positions = new Float32Array(count * 3);
+    const seeds = new Float32Array(count);
+    const sizes = new Float32Array(count);
 
-    for (let i = 0; i < AMBIENT_COUNT; i++) {
+    for (let i = 0; i < count; i++) {
       positions[i * 3] = (Math.random() - 0.5) * 70;
       positions[i * 3 + 1] = Math.random() * 24 - 4;
       positions[i * 3 + 2] = (Math.random() - 0.5) * 70;
@@ -108,6 +102,7 @@ export class AmbientAtmosphereSystem {
         uWindDir: { value: new THREE.Vector3(1, 0, 0) },
         uSeasonWeights: { value: new THREE.Vector3(1, 0, 0) },
         uWakeTex: { value: wakeTexture },
+        uPointScale: { value: pointScale },
       },
       vertexShader: AMBIENT_VERTEX,
       fragmentShader: AMBIENT_FRAGMENT,
@@ -119,6 +114,10 @@ export class AmbientAtmosphereSystem {
     this.points = new THREE.Points(this.geometry, this.material);
     this.points.frustumCulled = false;
     this.points.renderOrder = 10;
+  }
+
+  public setPointScale(scale: number): void {
+    this.material.uniforms.uPointScale.value = scale;
   }
 
   public update(
@@ -144,6 +143,8 @@ const BURST_VERTEX = /* glsl */ `
   attribute vec3 aColor;
   attribute float aSize;
 
+  uniform float uPointScale;
+
   varying float vLife;
   varying vec3 vColor;
 
@@ -152,11 +153,12 @@ const BURST_VERTEX = /* glsl */ `
     vColor = aColor;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mvPosition;
-    gl_PointSize = aSize * aLife * (24.0 / max(1.0, -mvPosition.z));
+    gl_PointSize = clamp(aSize * aLife * uPointScale * (24.0 / max(1.0, -mvPosition.z)), 1.0, 26.0);
   }
 `;
 
 const BURST_FRAGMENT = /* glsl */ `
+  precision mediump float;
   varying float vLife;
   varying vec3 vColor;
 
@@ -173,18 +175,26 @@ export type BurstKind = 'splash' | 'spark' | 'plant';
 
 export class ImpactBurstSystem {
   public readonly points: THREE.Points;
+  private readonly capacity: number;
   private readonly geometry: THREE.BufferGeometry;
   private readonly material: THREE.ShaderMaterial;
 
-  private readonly positions = new Float32Array(BURST_CAPACITY * 3);
-  private readonly velocities = new Float32Array(BURST_CAPACITY * 3);
-  private readonly colors = new Float32Array(BURST_CAPACITY * 3);
-  private readonly lives = new Float32Array(BURST_CAPACITY);
-  private readonly sizes = new Float32Array(BURST_CAPACITY);
+  private readonly positions: Float32Array;
+  private readonly velocities: Float32Array;
+  private readonly colors: Float32Array;
+  private readonly lives: Float32Array;
+  private readonly sizes: Float32Array;
   private head = 0;
 
-  constructor() {
-    for (let i = 0; i < BURST_CAPACITY; i++) {
+  constructor(capacity = 1_800, pointScale = 1.0) {
+    this.capacity = capacity;
+    this.positions = new Float32Array(capacity * 3);
+    this.velocities = new Float32Array(capacity * 3);
+    this.colors = new Float32Array(capacity * 3);
+    this.lives = new Float32Array(capacity);
+    this.sizes = new Float32Array(capacity);
+
+    for (let i = 0; i < capacity; i++) {
       this.positions[i * 3 + 1] = -10000;
     }
 
@@ -195,6 +205,9 @@ export class ImpactBurstSystem {
     this.geometry.setAttribute('aSize', new THREE.BufferAttribute(this.sizes, 1));
 
     this.material = new THREE.ShaderMaterial({
+      uniforms: {
+        uPointScale: { value: pointScale },
+      },
       vertexShader: BURST_VERTEX,
       fragmentShader: BURST_FRAGMENT,
       transparent: true,
@@ -204,14 +217,20 @@ export class ImpactBurstSystem {
 
     this.points = new THREE.Points(this.geometry, this.material);
     this.points.frustumCulled = false;
+    this.points.visible = false;
     this.points.renderOrder = 16;
   }
 
+  public setPointScale(scale: number): void {
+    this.material.uniforms.uPointScale.value = scale;
+  }
+
   public spawnBurst(worldPos: THREE.Vector3, count: number, kind: BurstKind): void {
+    this.points.visible = true;
     for (let i = 0; i < count; i++) {
       const idx = this.head;
       const i3 = idx * 3;
-      this.head = (this.head + 1) % BURST_CAPACITY;
+      this.head = (this.head + 1) % this.capacity;
 
       const angle = Math.random() * Math.PI * 2;
       const speedHoriz =
@@ -255,11 +274,13 @@ export class ImpactBurstSystem {
   }
 
   public update(dt: number): void {
+    if (!this.points.visible) return;
+
     let anyAlive = false;
     const gravity = 9.8;
     const drag = Math.exp(-1.5 * dt);
 
-    for (let i = 0; i < BURST_CAPACITY; i++) {
+    for (let i = 0; i < this.capacity; i++) {
       const life = this.lives[i];
       if (life <= 0) continue;
 
@@ -281,6 +302,8 @@ export class ImpactBurstSystem {
       (this.geometry.attributes.aColor as THREE.BufferAttribute).needsUpdate = true;
       (this.geometry.attributes.aLife as THREE.BufferAttribute).needsUpdate = true;
       (this.geometry.attributes.aSize as THREE.BufferAttribute).needsUpdate = true;
+    } else {
+      this.points.visible = false;
     }
   }
 
@@ -320,14 +343,12 @@ export const AtmospherePostShader = {
       vec2 toCenter = vUv - vec2(0.5);
       float radialDist = length(toCenter);
 
-      // Subtle velocity & seismic-reactive chromatic aberration at edges
       vec2 caOffset = toCenter * uChromaticAmount * (0.4 + radialDist * 1.6);
       float r = texture2D(tDiffuse, clamp(vUv + caOffset, 0.0, 1.0)).r;
       vec4 centerSample = texture2D(tDiffuse, vUv);
       float b = texture2D(tDiffuse, clamp(vUv - caOffset, 0.0, 1.0)).b;
       vec3 col = vec3(r, centerSample.g, b);
 
-      // Volumetric Radial Sunbeams (Crepuscular Screen-Space God Rays)
       if (uSunIntensity > 0.005) {
         vec2 deltaUv = (vUv - uSunScreenPos) * (1.0 / 12.0) * 0.65;
         vec2 sampleUv = vUv;
@@ -345,7 +366,6 @@ export const AtmospherePostShader = {
         col += (rays / 12.0) * uSunColor * uSunIntensity * (0.4 + 0.6 * sunMask);
       }
 
-      // Soft museum framing vignette
       float vignette = smoothstep(0.95, 0.28, radialDist);
       col *= mix(1.0, vignette, uVignetteStrength);
 

@@ -34,6 +34,18 @@ const SIM_FRAGMENT = /* glsl */ `
   uniform float uSplat2Energy;
   uniform float uSplat2Active;
 
+  uniform vec2 uSplat3Uv;
+  uniform vec2 uSplat3Vel;
+  uniform float uSplat3RadiusUv;
+  uniform float uSplat3Energy;
+  uniform float uSplat3Active;
+
+  uniform vec2 uSplat4Uv;
+  uniform vec2 uSplat4Vel;
+  uniform float uSplat4RadiusUv;
+  uniform float uSplat4Energy;
+  uniform float uSplat4Active;
+
   varying vec2 vUv;
 
   void injectSplat(
@@ -102,6 +114,12 @@ const SIM_FRAGMENT = /* glsl */ `
     if (uSplat2Active > 0.5) {
       injectSplat(uSplat2Uv, uSplat2Vel, uSplat2RadiusUv, uSplat2Energy, bVel, energy, ripple);
     }
+    if (uSplat3Active > 0.5) {
+      injectSplat(uSplat3Uv, uSplat3Vel, uSplat3RadiusUv, uSplat3Energy, bVel, energy, ripple);
+    }
+    if (uSplat4Active > 0.5) {
+      injectSplat(uSplat4Uv, uSplat4Vel, uSplat4RadiusUv, uSplat4Energy, bVel, energy, ripple);
+    }
 
     gl_FragColor = vec4(bVel * 0.5 + 0.5, energy, ripple);
   }
@@ -116,7 +134,7 @@ export interface WakeSplatInput {
 }
 
 /**
- * Dual-splat GPU Ping-Pong FBO simulation covering the 70x70 world XZ footprint.
+ * Multi-visitor GPU Ping-Pong FBO simulation supporting up to 4 simultaneous splats.
  */
 export class FluidWakeSimulation {
   private targetA: THREE.WebGLRenderTarget;
@@ -132,8 +150,7 @@ export class FluidWakeSimulation {
 
   private readonly worldSize = 70.0;
 
-  constructor(renderer: THREE.WebGLRenderer, isSoftwareGl: boolean) {
-    const resolution = isSoftwareGl ? 128 : 256;
+  constructor(renderer: THREE.WebGLRenderer, resolution = 256) {
     const gl = renderer.getContext();
     const supportsHalfFloat =
       renderer.capabilities.isWebGL2 &&
@@ -182,6 +199,16 @@ export class FluidWakeSimulation {
         uSplat2RadiusUv: { value: 0.08 },
         uSplat2Energy: { value: 0.0 },
         uSplat2Active: { value: 0.0 },
+        uSplat3Uv: { value: new THREE.Vector2(0.5, 0.5) },
+        uSplat3Vel: { value: new THREE.Vector2(0.0, 0.0) },
+        uSplat3RadiusUv: { value: 0.08 },
+        uSplat3Energy: { value: 0.0 },
+        uSplat3Active: { value: 0.0 },
+        uSplat4Uv: { value: new THREE.Vector2(0.5, 0.5) },
+        uSplat4Vel: { value: new THREE.Vector2(0.0, 0.0) },
+        uSplat4RadiusUv: { value: 0.08 },
+        uSplat4Energy: { value: 0.0 },
+        uSplat4Active: { value: 0.0 },
       },
       vertexShader: SIM_VERTEX,
       fragmentShader: SIM_FRAGMENT,
@@ -224,6 +251,7 @@ export class FluidWakeSimulation {
     modeId: number,
     splatA: WakeSplatInput,
     splatB?: WakeSplatInput,
+    remoteSplats?: WakeSplatInput[],
   ): void {
     const clampedDt = Math.min(Math.max(dt, 0.001), 0.05);
     const uniforms = this.simMaterial.uniforms;
@@ -232,11 +260,14 @@ export class FluidWakeSimulation {
     uniforms.uModeId.value = modeId;
 
     this.assignSplat(splatA, 'uSplat');
-    if (splatB) {
-      this.assignSplat(splatB, 'uSplat2');
-    } else {
-      uniforms.uSplat2Active.value = 0.0;
-    }
+    if (splatB) this.assignSplat(splatB, 'uSplat2');
+    else uniforms.uSplat2Active.value = 0.0;
+
+    if (remoteSplats && remoteSplats[0]) this.assignSplat(remoteSplats[0], 'uSplat3');
+    else uniforms.uSplat3Active.value = 0.0;
+
+    if (remoteSplats && remoteSplats[1]) this.assignSplat(remoteSplats[1], 'uSplat4');
+    else uniforms.uSplat4Active.value = 0.0;
 
     const prevTarget = renderer.getRenderTarget();
     const prevXr = renderer.xr.enabled;
@@ -253,7 +284,7 @@ export class FluidWakeSimulation {
     this.writeTarget = temp;
   }
 
-  private assignSplat(splat: WakeSplatInput, prefix: 'uSplat' | 'uSplat2'): void {
+  private assignSplat(splat: WakeSplatInput, prefix: 'uSplat' | 'uSplat2' | 'uSplat3' | 'uSplat4'): void {
     const uniforms = this.simMaterial.uniforms;
     const u = splat.worldPos.x / this.worldSize + 0.5;
     const v = splat.worldPos.z / this.worldSize + 0.5;

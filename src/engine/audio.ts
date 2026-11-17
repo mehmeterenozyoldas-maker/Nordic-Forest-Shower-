@@ -18,8 +18,16 @@ export class SoundscapeEngine {
   private lastNoteAt = 0;
   private smoothedEnergy = 0;
 
+  private readonly panningModel: 'HRTF' | 'equalpower';
+
+  private readonly _camWorldPos = new THREE.Vector3();
+  private readonly _camWorldQuat = new THREE.Quaternion();
   private readonly _forward = new THREE.Vector3();
   private readonly _up = new THREE.Vector3();
+
+  constructor(panningModel: 'HRTF' | 'equalpower' = 'HRTF') {
+    this.panningModel = panningModel;
+  }
 
   public get isInitialized(): boolean {
     return this.initialized;
@@ -47,7 +55,7 @@ export class SoundscapeEngine {
       this.masterVol.connect(this.meter);
 
       this.panner = new Tone.Panner3D({
-        panningModel: 'HRTF',
+        panningModel: this.panningModel,
         distanceModel: 'inverse',
         refDistance: 8,
         maxDistance: 120,
@@ -96,12 +104,14 @@ export class SoundscapeEngine {
     if (!this.initialized || !this.panner) return;
 
     const listener = Tone.getListener();
-    camera.getWorldDirection(this._forward);
-    this._up.copy(camera.up).applyQuaternion(camera.quaternion);
+    camera.getWorldPosition(this._camWorldPos);
+    camera.getWorldQuaternion(this._camWorldQuat);
+    this._forward.set(0, 0, -1).applyQuaternion(this._camWorldQuat).normalize();
+    this._up.set(0, 1, 0).applyQuaternion(this._camWorldQuat).normalize();
 
-    listener.positionX.value = camera.position.x;
-    listener.positionY.value = camera.position.y;
-    listener.positionZ.value = camera.position.z;
+    listener.positionX.value = this._camWorldPos.x;
+    listener.positionY.value = this._camWorldPos.y;
+    listener.positionZ.value = this._camWorldPos.z;
     listener.forwardX.value = this._forward.x;
     listener.forwardY.value = this._forward.y;
     listener.forwardZ.value = this._forward.z;

@@ -5,48 +5,49 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { EXHIBITION_CHAPTERS } from '../data/chapters';
+import { CollabRoomClient } from '../inputs/collabClient';
+import { HandTrackerController } from '../inputs/handTracker';
+import { HardwareBridge } from '../inputs/hardwareBridge';
+import { parseRecordedNatureFile, sampleRecordingAt } from '../inputs/sensorParser';
+import { fetchLiveWeather } from '../services/archiveApi';
 import {
+  AtmosphereSnapshot,
+  CameraTarget,
+  CollabState,
+  ForestPlate,
   HandTrackingState,
   HardwareConnectionState,
   InputSourceType,
   InteractionContext,
   InteractionMode,
+  KioskState,
   ModeType,
   PlantSpecies,
   PlaybackStatus,
   RecordingStatus,
+  SavedPlantedTree,
   Season,
   SensorRecording,
   SimulationHUDState,
   SimulationParams,
+  TerrainConfig,
+  WeatherSyncState,
   WebXRState,
 } from '../types/simulation';
+import {
+  computeSolarPosition,
+  mapWeatherToAtmosphere,
+  NORDIC_WEATHER_STATIONS,
+} from '../utils/solar';
 import { SoundscapeEngine } from './audio';
 import { ContextCursorVisuals } from './cursorVisuals';
 import { ParticleEnvironment, terrainHeight } from './environment';
 import { FluidWakeSimulation, WakeSplatInput } from './fluidFbo';
+import { buildQualityProfile, QualityProfile } from './quality';
 import { CanvasRecorder } from './recorder';
 import { createForestMaterial } from './shaders';
 import { AmbientAtmosphereSystem, AtmospherePostShader, ImpactBurstSystem } from './vfx';
 import { WebXRManager } from './webxr';
-import { HandTrackerController } from '../inputs/handTracker';
-import { HardwareBridge } from '../inputs/hardwareBridge';
-import { parseRecordedNatureFile, sampleRecordingAt } from '../inputs/sensorParser';
-
-function detectSoftwareWebGL(): boolean {
-  try {
-    const probeCanvas = document.createElement('canvas');
-    const gl = probeCanvas.getContext('webgl2');
-    if (!gl) return true;
-    const ext = gl.getExtension('WEBGL_debug_renderer_info');
-    const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
-    const gpu = String(gl.getParameter(param));
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-  } catch {
-    return false;
-  }
-}
 
 const MODE_IDS: Record<InteractionMode, number> = {
   'Wind Gust': 0,
@@ -56,6 +57,17 @@ const MODE_IDS: Record<InteractionMode, number> = {
   'Seismic Ripple': 4,
   'Aurora Field': 5,
 };
+
+const INTERACTION_MODES_ORDER: InteractionMode[] = [
+  'Fluid Push/Pull',
+  'Wind Gust',
+  'Tornado',
+  'Parting',
+  'Aurora Field',
+  'Seismic Ripple',
+];
+
+const PLANT_SPECIES_ORDER: PlantSpecies[] = ['Oak', 'Pine', 'Bush'];
 
 const CONTEXT_IDS: Record<InteractionContext, number> = {
   All: 0,
@@ -72,13 +84,14 @@ function seasonToWeights(season: Season, out: THREE.Vector3): void {
 
 export class SimulationController {
   private readonly mountEl: HTMLElement;
+  private readonly profile: QualityProfile;
   private readonly isSoftwareGl: boolean;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly camera: THREE.PerspectiveCamera;
-  private readonly composer: EffectComposer;
-  private readonly bloomPass: UnrealBloomPass;
-  private readonly atmospherePass: ShaderPass;
+  private readonly composer: EffectComposer | null = null;
+  private readonly bloomPass: UnrealBloomPass | null = null;
+  private readonly atmospherePass: ShaderPass | null = null;
 
   private readonly fluidFbo: FluidWakeSimulation;
   private readonly environment: ParticleEnvironment;
@@ -89,14 +102,18 @@ export class SimulationController {
   private readonly burstVfx: ImpactBurstSystem;
   private readonly webxr: WebXRManager;
 
-  private readonly audio = new SoundscapeEngine();
+  private readonly audio: SoundscapeEngine;
   private readonly recorder: CanvasRecorder;
   private readonly handTracker: HandTrackerController;
   private readonly hardware: HardwareBridge;
+  private readonly collab: CollabRoomClient;
 
   private readonly params: SimulationParams;
   private chapterIndex = 0;
   private plantedCount = 0;
+  private activePlateTitle: string | null = null;
+  private activePlateAuthor: string | null = null;
+  private activePlateAccession: string | null = null;
 
   // Input state (normalized & damped)
   private activeSource: InputSourceType = 'pointer';
@@ -140,6 +157,33 @@ export class SimulationController {
     error: null,
   };
 
+  // Weather & Solar Sync
+  private weatherState: WeatherSyncState = {
+    enabled: false,
+    loading: false,
+    stationId: 'tromso',
+    stationName: 'Tromsø',
+    solarElevationDeg: 0,
+    observation: null,
+    error: null,
+  };
+  private weatherLat = NORDIC_WEATHER_STATIONS[0].latitude;
+  private weatherLon = NORDIC_WEATHER_STATIONS[0].longitude;
+  private weatherTimer: number | null = null;
+
+  // Collaborative Live Room
+  private collabState: CollabState;
+
+  // Kiosk Projection Mode
+  private kioskPlates: ForestPlate[] = [];
+  private kioskTimer: number | null = null;
+  private kioskState: KioskState = {
+    enabled: false,
+    intervalSec: 45,
+    plateIndex: 0,
+    plateTotal: 0,
+  };
+
   // Camera Choreography & Navigation
   private readonly keys: Record<string, boolean> = {
     w: false,
@@ -160,7 +204,9 @@ export class SimulationController {
   private targetBloom = EXHIBITION_CHAPTERS[0].bloomStrength;
   private targetFog = EXHIBITION_CHAPTERS[0].fogDensity;
   private targetSunElevation = EXHIBITION_CHAPTERS[0].sunElevation;
+  private targetSunAzimuth = 0.5;
   private targetWindStrength = EXHIBITION_CHAPTERS[0].windStrength;
+  private targetWindDirection = 0.0;
 
   private attractMode = false;
   private lastInteractionTime = Date.now();
@@ -205,6 +251,22 @@ export class SimulationController {
     force: 0,
     active: false,
   };
+  private readonly _remoteSplats: WakeSplatInput[] = [
+    {
+      worldPos: new THREE.Vector3(999, 999, 999),
+      velocity: new THREE.Vector3(),
+      radiusWorld: 5.0,
+      force: 0,
+      active: false,
+    },
+    {
+      worldPos: new THREE.Vector3(999, 999, 999),
+      velocity: new THREE.Vector3(),
+      radiusWorld: 5.0,
+      force: 0,
+      active: false,
+    },
+  ];
 
   private smoothedNdcX = 0;
   private smoothedNdcY = 0;
@@ -251,16 +313,19 @@ export class SimulationController {
   constructor(mountEl: HTMLElement, onHudUpdate: (state: SimulationHUDState) => void) {
     this.mountEl = mountEl;
     this.onHudUpdate = onHudUpdate;
-    this.isSoftwareGl = detectSoftwareWebGL();
+    this.profile = buildQualityProfile();
+    this.isSoftwareGl = this.profile.isSoftwareGl;
+    this.audio = new SoundscapeEngine(this.profile.audioPanningModel);
 
     const ch0 = EXHIBITION_CHAPTERS[0];
     this.params = {
+      terrainSeed: 104729,
       mode: 'explore',
       season: ch0.season,
       riverWidth: 4.0,
       terrainRoughness: 2.0,
       treeScale: 0.7,
-      treeDensity: 35,
+      treeDensity: this.profile.treeDensity,
       plantType: 'Oak',
       interactionMode: ch0.interactionMode,
       interactionContext: ch0.interactionContext,
@@ -288,61 +353,94 @@ export class SimulationController {
     this.camera.lookAt(0, 0, 0);
 
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
+      antialias: !this.isSoftwareGl && !this.profile.isQuestOrMobile,
       alpha: false,
       powerPreference: 'high-performance',
       preserveDrawingBuffer: false,
     });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.toneMappingExposure = this.profile.useComposer ? 1.08 : 1.18;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.profile.maxPixelRatio));
     this.renderer.setSize(width, height);
     this.mountEl.appendChild(this.renderer.domElement);
 
-    // WebXR Manager (adds camera inside vrCameraGroup + controllers + hands)
-    this.webxr = new WebXRManager(this.renderer, this.scene, this.camera, (state) => {
-      this.webxrState = state;
-      this.emitHud(true);
-    });
+    // WebXR Manager tuned for Meta Quest 3S
+    this.webxr = new WebXRManager(
+      this.renderer,
+      this.scene,
+      this.camera,
+      this.profile,
+      (state) => {
+        this.webxrState = state;
+        this.emitHud(true);
+      },
+      {
+        onToggleMode: () => {
+          this.setMode(this.params.mode === 'explore' ? 'plant' : 'explore');
+        },
+        onCycleSecondary: () => {
+          if (this.params.mode === 'plant') {
+            const idx = PLANT_SPECIES_ORDER.indexOf(this.params.plantType);
+            this.setPlantType(PLANT_SPECIES_ORDER[(idx + 1) % PLANT_SPECIES_ORDER.length]);
+          } else {
+            const idx = INTERACTION_MODES_ORDER.indexOf(this.params.interactionMode);
+            this.setInteractionMode(INTERACTION_MODES_ORDER[(idx + 1) % INTERACTION_MODES_ORDER.length]);
+          }
+        },
+        onClearWakes: () => {
+          this.clearFluidWakes();
+        },
+      },
+    );
 
     // GPU Ping-Pong Fluid Wake FBO
-    this.fluidFbo = new FluidWakeSimulation(this.renderer, this.isSoftwareGl);
+    this.fluidFbo = new FluidWakeSimulation(this.renderer, this.profile.fboResolution);
 
-    // 1.5M Particle Environment
-    this.environment = new ParticleEnvironment(this.params);
-    this.forestMaterial = createForestMaterial(this.fluidFbo.texture);
+    // Adaptive Particle Environment
+    this.environment = new ParticleEnvironment(this.params, this.profile);
+    this.forestMaterial = createForestMaterial(
+      this.fluidFbo.texture,
+      this.profile.pointScale,
+      this.profile.maxPointSize,
+    );
     this.points = new THREE.Points(this.environment.geometry, this.forestMaterial);
     this.points.frustumCulled = false;
     this.scene.add(this.points);
 
-    // Phase 2 Ambient Spores / Fireflies / Snow + Impact Bursts
-    this.ambientVfx = new AmbientAtmosphereSystem(this.fluidFbo.texture);
+    // Ambient VFX & Burst Droplets
+    this.ambientVfx = new AmbientAtmosphereSystem(
+      this.fluidFbo.texture,
+      this.profile.ambientVfxCount,
+      this.profile.pointScale,
+    );
     this.scene.add(this.ambientVfx.points);
 
-    this.burstVfx = new ImpactBurstSystem();
+    this.burstVfx = new ImpactBurstSystem(this.profile.burstCapacity, this.profile.pointScale);
     this.scene.add(this.burstVfx.points);
 
-    // Context-Aware Dual 3D Cursors & Trails
-    this.cursorVisuals = new ContextCursorVisuals();
+    // Context-Aware Dual + Remote 3D Cursors & Trails
+    this.cursorVisuals = new ContextCursorVisuals(this.profile.pointScale);
     this.scene.add(this.cursorVisuals.group);
 
-    // Post-Processing Composer (Render -> Bloom -> Volumetric Sunbeams/CA/Vignette -> OutputPass)
-    this.composer = new EffectComposer(this.renderer);
-    this.composer.setSize(width, height);
-    const renderPass = new RenderPass(this.scene, this.camera);
-    this.bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(width, height),
-      this.params.bloomStrength,
-      0.65,
-      0.22,
-    );
-    this.atmospherePass = new ShaderPass(AtmospherePostShader);
-    const outputPass = new OutputPass();
-    this.composer.addPass(renderPass);
-    this.composer.addPass(this.bloomPass);
-    this.composer.addPass(this.atmospherePass);
-    this.composer.addPass(outputPass);
+    // Post-Processing Composer (Desktop GPUs only; bypassed on Quest 3S / Mobile / Software WebGL)
+    if (this.profile.useComposer) {
+      this.composer = new EffectComposer(this.renderer);
+      this.composer.setSize(width, height);
+      const renderPass = new RenderPass(this.scene, this.camera);
+      this.bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(width, height),
+        this.params.bloomStrength,
+        0.65,
+        0.22,
+      );
+      this.atmospherePass = new ShaderPass(AtmospherePostShader);
+      const outputPass = new OutputPass();
+      this.composer.addPass(renderPass);
+      this.composer.addPass(this.bloomPass);
+      this.composer.addPass(this.atmospherePass);
+      this.composer.addPass(outputPass);
+    }
 
     if (!this.isSoftwareGl) {
       this.renderer.compile(this.scene, this.camera);
@@ -406,6 +504,37 @@ export class SimulationController {
     );
     this.hardwareState = this.hardware.status;
 
+    this.collab = new CollabRoomClient(
+      (state) => {
+        this.collabState = state;
+        this.emitHud(true);
+      },
+      (trees) => {
+        const elapsed = this.clock.getElapsedTime();
+        const added = this.environment.restorePlantedTrees(
+          trees,
+          this.params.terrainRoughness,
+          this.params.season,
+          elapsed,
+        );
+        if (added > 0) {
+          this.plantedCount = this.environment.getPlantedTrees().length;
+          const last = trees[trees.length - 1];
+          this._plantHit.set(
+            last.x,
+            terrainHeight(last.x, last.z, this.params.terrainRoughness),
+            last.z,
+          );
+          this.burstVfx.spawnBurst(this._plantHit, 55, 'plant');
+          this.emitHud(true);
+        }
+      },
+      () => {
+        this.fluidFbo.clear(this.renderer);
+      },
+    );
+    this.collabState = this.collab.status;
+
     this.bindEvents();
     this.emitHud(true);
     this.startLoop();
@@ -466,7 +595,7 @@ export class SimulationController {
     if (this.renderer.xr.isPresenting) return;
     const width = this.mountEl.clientWidth || window.innerWidth;
     const height = this.mountEl.clientHeight || window.innerHeight;
-    const pixelRatio = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2);
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, this.profile.maxPixelRatio);
 
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
@@ -474,9 +603,11 @@ export class SimulationController {
     this.renderer.setPixelRatio(pixelRatio);
     this.renderer.setSize(width, height);
 
-    this.composer.setPixelRatio(pixelRatio);
-    this.composer.setSize(width, height);
-    this.bloomPass.resolution.set(width, height);
+    if (this.composer && this.bloomPass) {
+      this.composer.setPixelRatio(pixelRatio);
+      this.composer.setSize(width, height);
+      this.bloomPass.resolution.set(width, height);
+    }
   };
 
   private handleKeyDown = (e: KeyboardEvent): void => {
@@ -553,16 +684,328 @@ export class SimulationController {
       this.params.season,
       elapsed,
     );
-    if (res.ok) {
-      this.plantedCount++;
+    if (res.ok && res.tree) {
+      this.plantedCount = this.environment.getPlantedTrees().length;
       this._plantHit.set(x, res.y, z);
       this.burstVfx.spawnBurst(this._plantHit, 75, 'plant');
       this.audio.triggerPlantChime();
+      this.collab.sendPlantTree(res.tree);
       this.emitHud(true);
     }
   }
 
-  // --- Public Controls for UI ---
+  // --- Archive & Snapshot Methods ---
+
+  public captureThumbnailDataUrl(): string | null {
+    try {
+      if (!this.composer || this.renderer.xr.isPresenting) {
+        this.renderer.render(this.scene, this.camera);
+      } else {
+        this.composer.render();
+      }
+      const src = this.renderer.domElement;
+      const thumb = document.createElement('canvas');
+      thumb.width = 480;
+      thumb.height = 270;
+      const ctx = thumb.getContext('2d');
+      if (!ctx) return null;
+      ctx.drawImage(src, 0, 0, thumb.width, thumb.height);
+      return thumb.toDataURL('image/jpeg', 0.72);
+    } catch {
+      return null;
+    }
+  }
+
+  public getArchiveExportPayload(): {
+    terrainConfig: TerrainConfig;
+    atmosphere: AtmosphereSnapshot;
+    cameraTarget: CameraTarget;
+    plantedTrees: SavedPlantedTree[];
+    thumbnailDataUrl: string | null;
+  } {
+    return {
+      terrainConfig: {
+        seed: this.params.terrainSeed,
+        riverWidth: this.params.riverWidth,
+        terrainRoughness: this.params.terrainRoughness,
+        treeDensity: this.params.treeDensity,
+        treeScale: this.params.treeScale,
+        baseSpecies: this.params.plantType,
+      },
+      atmosphere: {
+        season: this.params.season,
+        sunElevation: Number(this.params.sunElevation.toFixed(3)),
+        sunAzimuth: Number(this.params.sunAzimuth.toFixed(3)),
+        fogDensity: Number(this.params.fogDensity.toFixed(4)),
+        bloomStrength: Number(this.params.bloomStrength.toFixed(2)),
+        windStrength: Number(this.params.windStrength.toFixed(2)),
+        windDirection: Number(this.params.windDirection.toFixed(2)),
+        interactionMode: this.params.interactionMode,
+        interactionContext: this.params.interactionContext,
+      },
+      cameraTarget: {
+        theta: Number(this.camTheta.toFixed(3)),
+        phi: Number(this.camPhi.toFixed(3)),
+        radius: Number(this.camRadius.toFixed(2)),
+      },
+      plantedTrees: this.environment.getPlantedTrees(),
+      thumbnailDataUrl: this.captureThumbnailDataUrl(),
+    };
+  }
+
+  public loadForestPlate(plate: ForestPlate): void {
+    this.activePlateTitle = plate.title;
+    this.activePlateAuthor = plate.authorName;
+    this.activePlateAccession = plate.accessionCode;
+
+    this.params.terrainSeed = plate.terrainConfig.seed;
+    this.params.riverWidth = plate.terrainConfig.riverWidth;
+    this.params.terrainRoughness = plate.terrainConfig.terrainRoughness;
+    this.params.treeDensity = plate.terrainConfig.treeDensity;
+    this.params.treeScale = plate.terrainConfig.treeScale;
+    this.params.plantType = plate.terrainConfig.baseSpecies;
+
+    this.environment.generate(this.params, true);
+    const elapsed = this.clock.getElapsedTime();
+    this.environment.restorePlantedTrees(
+      plate.plantedTrees,
+      this.params.terrainRoughness,
+      plate.atmosphere.season,
+      elapsed,
+    );
+    this.plantedCount = this.environment.getPlantedTrees().length;
+
+    this.applyAtmospherePreset(plate.atmosphere, plate.cameraTarget);
+    this.fluidFbo.clear(this.renderer);
+    this.registerActivity();
+    this.emitHud(true);
+  }
+
+  public applyAtmospherePreset(
+    atmo: AtmosphereSnapshot,
+    cameraTarget?: CameraTarget,
+  ): void {
+    this.params.season = atmo.season;
+    seasonToWeights(atmo.season, this._targetSeasonWeights);
+    this.params.interactionMode = atmo.interactionMode;
+    this.params.interactionContext = atmo.interactionContext;
+
+    this.targetWindStrength = atmo.windStrength;
+    this.targetWindDirection = atmo.windDirection;
+    this.targetFog = atmo.fogDensity;
+    this.targetSunElevation = atmo.sunElevation;
+    this.targetSunAzimuth = atmo.sunAzimuth;
+    this.targetBloom = atmo.bloomStrength;
+
+    if (cameraTarget) {
+      this.targetCamTheta = cameraTarget.theta;
+      this.targetCamPhi = cameraTarget.phi;
+      this.targetCamRadius = cameraTarget.radius;
+      this.flythroughActive = true;
+    }
+
+    this.syncVrWristHud();
+    this.emitHud(true);
+  }
+
+  // --- Studio & Atmosphere Direct Controls ---
+
+  public setSeason(season: Season): void {
+    this.params.season = season;
+    seasonToWeights(season, this._targetSeasonWeights);
+    this.emitHud(true);
+  }
+
+  public setSunElevation(rad: number): void {
+    const val = THREE.MathUtils.clamp(rad, -0.3, 1.3);
+    this.params.sunElevation = val;
+    this.targetSunElevation = val;
+    this.emitHud(true);
+  }
+
+  public setSunAzimuth(rad: number): void {
+    this.params.sunAzimuth = rad;
+    this.targetSunAzimuth = rad;
+    this.emitHud(true);
+  }
+
+  public setFogDensity(density: number): void {
+    const val = THREE.MathUtils.clamp(density, 0.002, 0.045);
+    this.params.fogDensity = val;
+    this.targetFog = val;
+    this.emitHud(true);
+  }
+
+  public setBloomStrength(strength: number): void {
+    const val = THREE.MathUtils.clamp(strength, 0.2, 2.0);
+    this.params.bloomStrength = val;
+    this.targetBloom = val;
+    this.emitHud(true);
+  }
+
+  public setWindDirection(rad: number): void {
+    this.params.windDirection = rad;
+    this.targetWindDirection = rad;
+    this.emitHud(true);
+  }
+
+  // --- Real-Time Weather & Solar Sync ---
+
+  public async enableWeatherSync(stationId: string): Promise<void> {
+    const station =
+      NORDIC_WEATHER_STATIONS.find((s) => s.id === stationId) ?? NORDIC_WEATHER_STATIONS[0];
+    this.weatherLat = station.latitude;
+    this.weatherLon = station.longitude;
+    this.weatherState = {
+      ...this.weatherState,
+      enabled: true,
+      loading: true,
+      stationId: station.id,
+      stationName: station.name,
+      error: null,
+    };
+    this.emitHud(true);
+    await this.pollWeatherNow();
+    this.startWeatherTimer();
+  }
+
+  public enableGeolocationWeatherSync(): void {
+    if (!navigator.geolocation) {
+      this.weatherState = {
+        ...this.weatherState,
+        error: 'Geolocation is not supported in this browser.',
+      };
+      this.emitHud(true);
+      return;
+    }
+    this.weatherState = { ...this.weatherState, enabled: true, loading: true, error: null };
+    this.emitHud(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        this.weatherLat = pos.coords.latitude;
+        this.weatherLon = pos.coords.longitude;
+        this.weatherState.stationId = 'custom';
+        this.weatherState.stationName = `${this.weatherLat.toFixed(1)}°, ${this.weatherLon.toFixed(1)}°`;
+        void this.pollWeatherNow();
+        this.startWeatherTimer();
+      },
+      () => {
+        this.weatherState = {
+          ...this.weatherState,
+          loading: false,
+          error: 'Location permission declined. Using Arctic station.',
+        };
+        void this.enableWeatherSync('tromso');
+      },
+      { timeout: 6000 },
+    );
+  }
+
+  public disableWeatherSync(): void {
+    if (this.weatherTimer !== null) {
+      clearInterval(this.weatherTimer);
+      this.weatherTimer = null;
+    }
+    this.weatherState = { ...this.weatherState, enabled: false, loading: false };
+    this.emitHud(true);
+  }
+
+  private startWeatherTimer(): void {
+    if (this.weatherTimer !== null) clearInterval(this.weatherTimer);
+    this.weatherTimer = window.setInterval(() => {
+      if (this.weatherState.enabled) void this.pollWeatherNow();
+    }, 300_000);
+  }
+
+  private async pollWeatherNow(): Promise<void> {
+    try {
+      const obs = await fetchLiveWeather(this.weatherLat, this.weatherLon);
+      const solar = computeSolarPosition(this.weatherLat, this.weatherLon, new Date());
+      const mapped = mapWeatherToAtmosphere(obs, solar);
+
+      this.params.season = mapped.season;
+      seasonToWeights(mapped.season, this._targetSeasonWeights);
+      this.targetWindStrength = mapped.windStrength;
+      this.targetWindDirection = mapped.windDirection;
+      this.targetFog = mapped.fogDensity;
+      this.targetBloom = mapped.bloomStrength;
+      this.targetSunElevation = mapped.sunElevation;
+      this.targetSunAzimuth = mapped.sunAzimuth;
+
+      this.weatherState = {
+        ...this.weatherState,
+        loading: false,
+        solarElevationDeg: solar.elevationDeg,
+        observation: obs,
+        error: null,
+      };
+      this.emitHud(true);
+    } catch (err) {
+      this.weatherState = {
+        ...this.weatherState,
+        loading: false,
+        error: err instanceof Error ? err.message : 'Unable to fetch weather.',
+      };
+      this.emitHud(true);
+    }
+  }
+
+  // --- Collaborative Multi-Visitor Room Methods ---
+
+  public joinCollabRoom(roomId: string, visitorName?: string): void {
+    this.collab.join(roomId, visitorName);
+  }
+
+  public leaveCollabRoom(): void {
+    this.collab.disconnect(true);
+  }
+
+  public updateVisitorName(name: string): void {
+    this.collab.updateName(name);
+  }
+
+  // --- Museum Kiosk Mode ---
+
+  public setKioskPlates(plates: ForestPlate[]): void {
+    this.kioskPlates = plates.filter((p) => p.visibility === 'public');
+    this.kioskState.plateTotal = this.kioskPlates.length;
+    this.emitHud(true);
+  }
+
+  public setKioskMode(enabled: boolean, intervalSec = 45): void {
+    if (this.kioskTimer !== null) {
+      clearInterval(this.kioskTimer);
+      this.kioskTimer = null;
+    }
+    this.kioskState = {
+      ...this.kioskState,
+      enabled,
+      intervalSec,
+      plateTotal: this.kioskPlates.length,
+    };
+    if (enabled && this.kioskPlates.length > 0) {
+      this.attractMode = false;
+      this.advanceKioskPlate(0);
+      this.kioskTimer = window.setInterval(() => {
+        if (!this.kioskState.enabled || this.kioskPlates.length === 0) return;
+        const next = (this.kioskState.plateIndex + 1) % this.kioskPlates.length;
+        this.advanceKioskPlate(next);
+      }, intervalSec * 1000);
+    }
+    this.emitHud(true);
+  }
+
+  public advanceKioskPlate(idx?: number): void {
+    if (this.kioskPlates.length === 0) return;
+    const nextIdx =
+      idx !== undefined
+        ? idx % this.kioskPlates.length
+        : (this.kioskState.plateIndex + 1) % this.kioskPlates.length;
+    this.kioskState.plateIndex = nextIdx;
+    this.loadForestPlate(this.kioskPlates[nextIdx]);
+  }
+
+  // --- Existing Controls ---
 
   public attachHandTrackingElements(
     video: HTMLVideoElement | null,
@@ -581,18 +1024,27 @@ export class SimulationController {
   }
 
   public async toggleVR(): Promise<void> {
+    this.pointerActive = false;
     await this.initAudioIfNeeded();
-    await this.webxr.toggleVR();
+    await this.webxr.toggleVR(this.params.terrainRoughness);
+  }
+
+  private syncVrWristHud(): void {
+    const modeLabel = this.params.mode === 'plant' ? 'PLANT' : 'EXPLORE';
+    const detail = this.params.mode === 'plant' ? this.params.plantType : this.params.interactionMode;
+    this.webxr.updateWristHud(modeLabel, detail);
   }
 
   public setMode(mode: ModeType): void {
     this.params.mode = mode;
+    this.syncVrWristHud();
     this.registerActivity();
     this.emitHud(true);
   }
 
   public setPlantType(species: PlantSpecies): void {
     this.params.plantType = species;
+    this.syncVrWristHud();
     this.registerActivity();
     this.emitHud(true);
   }
@@ -601,12 +1053,15 @@ export class SimulationController {
     const ch = EXHIBITION_CHAPTERS[index];
     if (!ch) return;
     this.chapterIndex = index;
+    this.activePlateTitle = null;
+    this.activePlateAuthor = null;
+    this.activePlateAccession = null;
+
     this.params.interactionMode = ch.interactionMode;
     this.params.interactionContext = ch.interactionContext;
     this.params.season = ch.season;
     seasonToWeights(ch.season, this._targetSeasonWeights);
 
-    // Smoothly choreograph environmental and camera flythrough targets (zero CPU buffer stall!)
     this.targetWindStrength = ch.windStrength;
     this.targetFog = ch.fogDensity;
     this.targetSunElevation = ch.sunElevation;
@@ -618,6 +1073,7 @@ export class SimulationController {
     this.flythroughActive = true;
 
     this.fluidFbo.clear(this.renderer);
+    this.syncVrWristHud();
     this.registerActivity();
     this.emitHud(true);
   }
@@ -630,6 +1086,7 @@ export class SimulationController {
 
   public setInteractionMode(mode: InteractionMode): void {
     this.params.interactionMode = mode;
+    this.syncVrWristHud();
     this.registerActivity();
     this.emitHud(true);
   }
@@ -648,6 +1105,7 @@ export class SimulationController {
 
   public clearFluidWakes(): void {
     this.fluidFbo.clear(this.renderer);
+    this.collab.sendClearWake();
   }
 
   public async initAudioIfNeeded(): Promise<void> {
@@ -780,8 +1238,13 @@ export class SimulationController {
     const now = Date.now();
     const isVrPresenting = this.renderer.xr.isPresenting;
 
-    // Attract Mode Check
-    if (now - this.lastInteractionTime > this.attractTimeoutMs && !this.attractMode && !isVrPresenting) {
+    // Attract Mode Check (disabled in Kiosk or VR)
+    if (
+      now - this.lastInteractionTime > this.attractTimeoutMs &&
+      !this.attractMode &&
+      !isVrPresenting &&
+      !this.kioskState.enabled
+    ) {
       this.attractMode = true;
       this.emitHud(true);
     }
@@ -792,16 +1255,21 @@ export class SimulationController {
     }
 
     // Smooth seasonal + atmospheric transitions
-    const envDamp = 1 - Math.exp(-3.2 * deltaTime);
-    this._seasonWeights.lerp(this._targetSeasonWeights, envDamp);
-    this.params.windStrength = THREE.MathUtils.damp(this.params.windStrength, this.targetWindStrength, 3.2, deltaTime);
-    this.params.fogDensity = THREE.MathUtils.damp(this.params.fogDensity, this.targetFog, 3.2, deltaTime);
-    this.params.sunElevation = THREE.MathUtils.damp(this.params.sunElevation, this.targetSunElevation, 3.2, deltaTime);
-    this.params.bloomStrength = THREE.MathUtils.damp(this.params.bloomStrength, this.targetBloom, 3.2, deltaTime);
+    const envDamp = 3.2;
+    const seasonAlpha = 1 - Math.exp(-envDamp * deltaTime);
+    this._seasonWeights.lerp(this._targetSeasonWeights, seasonAlpha);
+    this.params.windStrength = THREE.MathUtils.damp(this.params.windStrength, this.targetWindStrength, envDamp, deltaTime);
+    this.params.windDirection = THREE.MathUtils.damp(this.params.windDirection, this.targetWindDirection, envDamp, deltaTime);
+    this.params.fogDensity = THREE.MathUtils.damp(this.params.fogDensity, this.targetFog, envDamp, deltaTime);
+    this.params.sunElevation = THREE.MathUtils.damp(this.params.sunElevation, this.targetSunElevation, envDamp, deltaTime);
+    this.params.sunAzimuth = THREE.MathUtils.damp(this.params.sunAzimuth, this.targetSunAzimuth, envDamp, deltaTime);
+    this.params.bloomStrength = THREE.MathUtils.damp(this.params.bloomStrength, this.targetBloom, envDamp, deltaTime);
     if (this.scene.fog instanceof THREE.FogExp2) {
       this.scene.fog.density = this.params.fogDensity;
     }
-    this.bloomPass.strength = this.params.bloomStrength;
+    if (this.bloomPass) {
+      this.bloomPass.strength = this.params.bloomStrength;
+    }
 
     // Advance Recorded Nature Playback
     let playbackActive = false;
@@ -831,8 +1299,9 @@ export class SimulationController {
       this.registerActivity();
     }
 
-    // WebXR Frame Update
+    // WebXR & Collaborative Smoothing Updates
     const xrReadings = this.webxr.update(deltaTime, this.camera, this.params.terrainRoughness);
+    this.collab.stepSmoothing(deltaTime);
 
     // Resolve Primary & Secondary Input Sources
     let targetNdcX = 0;
@@ -887,7 +1356,7 @@ export class SimulationController {
       targetNdcY = this.hardwareReading.y;
       targetInputForce = this.hardwareReading.force;
       hasActiveInput = true;
-    } else if (this.pointerActive) {
+    } else if (!isVrPresenting && this.pointerActive) {
       this.activeSource = 'pointer';
       targetNdcX = this.pointerNdc.x;
       targetNdcY = this.pointerNdc.y;
@@ -895,7 +1364,6 @@ export class SimulationController {
       hasActiveInput = true;
     }
 
-    // Project Primary Input to 3D World Space (unless WebXR already provided 3D coordinates)
     const groundLocked =
       this.params.mode === 'plant' ||
       this.params.interactionContext === 'Ground Only' ||
@@ -936,7 +1404,6 @@ export class SimulationController {
         this._currentMouse3D.lerp(this._targetMouse3D, 1 - Math.exp(-14.0 * deltaTime));
       }
 
-      // Hands-free Plant trigger via sustained single-hand pinch
       if (
         this.activeSource === 'hands' &&
         this.params.mode === 'plant' &&
@@ -953,7 +1420,6 @@ export class SimulationController {
       this._currentMouse3D.set(999, 999, 999);
     }
 
-    // Project Secondary Input (Second Hand or Second VR Controller)
     if (hasSecondaryInput) {
       if (this.activeSource !== 'webxr') {
         this.smoothedNdc2X = THREE.MathUtils.damp(this.smoothedNdc2X, targetNdc2X, 10.0, deltaTime);
@@ -991,7 +1457,6 @@ export class SimulationController {
       this._currentMouse2_3D.set(999, 999, 999);
     }
 
-    // Velocities for Primary & Secondary Cursors
     const safeDelta = Math.max(deltaTime, 0.001);
     let speed = 0;
     if (hasActiveInput && this._lastMouse3D.x < 900 && this._currentMouse3D.x < 900) {
@@ -1020,7 +1485,6 @@ export class SimulationController {
       if (hasSecondaryInput) this._lastMouse2_3D.copy(this._currentMouse2_3D);
     }
 
-    // Effective Interaction Forces (suspended during Plant mode so cursor acts as calm placement reticle)
     const exploreActive = this.params.mode === 'explore';
     let targetForce = 0.0;
     if (hasActiveInput && exploreActive) {
@@ -1034,6 +1498,44 @@ export class SimulationController {
       if (speed2 > 8.0) targetForce2 = 3.2 * this.smoothedForce2;
       else if (speed2 < 1.5) targetForce2 = 0.85 * this.smoothedForce2;
       else targetForce2 = 1.6 * this.smoothedForce2;
+    }
+
+    // Stream Primary Cursor to Collaborative WebSocket Room (when connected)
+    this.collab.sendCursor(
+      this._currentMouse3D,
+      this.forestMaterial.uniforms.uMouseVelocity.value as THREE.Vector3,
+      targetForce,
+      hasActiveInput && exploreActive,
+    );
+
+    // Prepare first active remote visitor for secondary vertex shader influence + FBO splats
+    let remoteShaderCandidate: {
+      worldPos: THREE.Vector3;
+      velocity: THREE.Vector3;
+      force: number;
+    } | null = null;
+    let remoteSplatIdx = 0;
+    this._remoteSplats[0].active = false;
+    this._remoteSplats[1].active = false;
+
+    for (const rc of this.collab.getRemoteCursors()) {
+      if (!rc.active || rc.worldPos.x > 900) continue;
+      if (!remoteShaderCandidate) {
+        remoteShaderCandidate = {
+          worldPos: rc.worldPos,
+          velocity: rc.velocity,
+          force: rc.force,
+        };
+      }
+      if (remoteSplatIdx < 2) {
+        const slot = this._remoteSplats[remoteSplatIdx];
+        slot.worldPos.copy(rc.worldPos);
+        slot.velocity.copy(rc.velocity);
+        slot.radiusWorld = this.params.interactionRadius * 0.9;
+        slot.force = rc.force;
+        slot.active = true;
+        remoteSplatIdx++;
+      }
     }
 
     // Kinetic Impact & Water Splash Bursts
@@ -1054,7 +1556,7 @@ export class SimulationController {
     const modeId = MODE_IDS[this.params.interactionMode];
     const contextId = CONTEXT_IDS[this.params.interactionContext];
 
-    // Step Dual-Splat Persistent GPU Fluid Wake FBO
+    // Step 4-Splat Persistent GPU Fluid Wake FBO (Local Dual + Remote Visitors)
     this._splatA.worldPos.copy(this._currentMouse3D);
     this._splatA.velocity.copy(this.forestMaterial.uniforms.uMouseVelocity.value as THREE.Vector3);
     this._splatA.radiusWorld = this.params.interactionRadius;
@@ -1067,20 +1569,45 @@ export class SimulationController {
     this._splatB.force = targetForce2;
     this._splatB.active = hasSecondaryInput && exploreActive;
 
-    this.fluidFbo.step(this.renderer, deltaTime, modeId, this._splatA, this._splatB);
+    this.fluidFbo.step(
+      this.renderer,
+      deltaTime,
+      modeId,
+      this._splatA,
+      this._splatB,
+      this._remoteSplats,
+    );
 
     // Update Forest Shader Uniforms
     const uniforms = this.forestMaterial.uniforms;
-    uniforms.uTime.value = this.attractMode ? elapsedTime * 1.35 : elapsedTime;
+    uniforms.uTime.value = this.attractMode || this.kioskState.enabled ? elapsedTime * 1.15 : elapsedTime;
+    const activePointScale = isVrPresenting ? this.profile.vrPointScale : this.profile.pointScale;
+    uniforms.uPointScale.value = activePointScale;
     uniforms.uMouse.value.copy(this._currentMouse3D);
     uniforms.uRadius.value = this.params.interactionRadius;
     uniforms.uInteractionType.value = modeId;
     uniforms.uInteractionContext.value = contextId;
     uniforms.uForce.value = THREE.MathUtils.damp(uniforms.uForce.value as number, targetForce, 8.0, deltaTime);
 
-    uniforms.uMouse2.value.copy(this._currentMouse2_3D);
-    uniforms.uForce2.value = THREE.MathUtils.damp(uniforms.uForce2.value as number, targetForce2, 8.0, deltaTime);
-    uniforms.uActive2.value = hasSecondaryInput && exploreActive ? 1.0 : 0.0;
+    if (hasSecondaryInput && exploreActive) {
+      uniforms.uMouse2.value.copy(this._currentMouse2_3D);
+      uniforms.uForce2.value = THREE.MathUtils.damp(uniforms.uForce2.value as number, targetForce2, 8.0, deltaTime);
+      uniforms.uActive2.value = 1.0;
+    } else if (remoteShaderCandidate) {
+      uniforms.uMouse2.value.copy(remoteShaderCandidate.worldPos);
+      (uniforms.uMouseVelocity2.value as THREE.Vector3).copy(remoteShaderCandidate.velocity);
+      uniforms.uForce2.value = THREE.MathUtils.damp(
+        uniforms.uForce2.value as number,
+        remoteShaderCandidate.force,
+        8.0,
+        deltaTime,
+      );
+      uniforms.uActive2.value = 1.0;
+    } else {
+      uniforms.uForce2.value = THREE.MathUtils.damp(uniforms.uForce2.value as number, 0.0, 8.0, deltaTime);
+      uniforms.uActive2.value = 0.0;
+    }
+
     (uniforms.uSeasonWeights.value as THREE.Vector3).copy(this._seasonWeights);
 
     const windX = Math.cos(this.params.windDirection);
@@ -1101,6 +1628,9 @@ export class SimulationController {
     uniforms.uFogDensity.value = this.params.fogDensity;
 
     // Update Atmospheric VFX & Burst Particles
+    this.ambientVfx.setPointScale(activePointScale);
+    this.burstVfx.setPointScale(activePointScale);
+    this.cursorVisuals.setPointScale(activePointScale);
     this.ambientVfx.update(
       elapsedTime,
       this.params.windStrength,
@@ -1109,7 +1639,7 @@ export class SimulationController {
     );
     this.burstVfx.update(deltaTime);
 
-    // Update Context-Aware Dual 3D Cursors & Trails
+    // Update Dual Local + Remote Visitor Cursors & Trails
     this.cursorVisuals.update(
       deltaTime,
       elapsedTime,
@@ -1124,14 +1654,15 @@ export class SimulationController {
       this._currentMouse2_3D,
       speed2,
       hasSecondaryInput,
+      this.collab.getRemoteCursors(),
     );
 
-    // Audio Modulation, 3D Spatial Panning & Energy Metering
+    // Spatial Audio Modulation & Energy Metering
     this.audio.syncSpatial(this.camera, this._currentMouse3D, hasActiveInput);
     this.audio.modulate(this.params.windStrength, speed, this.params.interactionMode);
     const audioEnergy = this.audio.getAudioEnergy();
 
-    // Camera Flythrough, Orbit, Audio Breathing & Seismic Micro-Shake (desktop mode only)
+    // Camera Flythrough, Orbit, Audio Breathing & Seismic Micro-Shake
     if (!isVrPresenting) {
       if (this.flythroughActive) {
         this.camTheta = THREE.MathUtils.damp(this.camTheta, this.targetCamTheta, 3.2, deltaTime);
@@ -1154,7 +1685,9 @@ export class SimulationController {
         if (this.keys.q) this.camRadius += zoomSpeed;
         if (this.keys.e) this.camRadius -= zoomSpeed;
 
-        if (this.attractMode) {
+        if (this.kioskState.enabled) {
+          this.camTheta += 0.075 * deltaTime;
+        } else if (this.attractMode) {
           this.camTheta += 0.1 * deltaTime;
         } else if (!this.keys.a && !this.keys.d) {
           this.camTheta += 0.025 * deltaTime;
@@ -1164,7 +1697,6 @@ export class SimulationController {
       this.camPhi = THREE.MathUtils.clamp(this.camPhi, 0.14, Math.PI / 2 - 0.06);
       this.camRadius = THREE.MathUtils.clamp(this.camRadius, 12, 72);
 
-      // Subtle audio-reactive camera breathing + seismic micro-shake
       const breathY = Math.sin(elapsedTime * 1.1) * (0.14 + audioEnergy * 0.45);
       const targetFov = 45 + audioEnergy * 1.6;
       if (Math.abs(this.camera.fov - targetFov) > 0.02) {
@@ -1190,8 +1722,8 @@ export class SimulationController {
       this.camera.lookAt(0, 0, 0);
     }
 
-    // Update Atmosphere Post-Processing Uniforms (Sunbeams + Chromatic Aberration + Vignette)
-    if (!this.isSoftwareGl && !isVrPresenting) {
+    // Atmosphere Post-Processing Uniforms
+    if (this.composer && this.atmospherePass && !isVrPresenting) {
       this._sunWorld
         .copy(uniforms.uSunDirection.value as THREE.Vector3)
         .multiplyScalar(120)
@@ -1227,15 +1759,15 @@ export class SimulationController {
       );
     }
 
-    // Render Scene (Bypass EffectComposer during WebXR presentation or Software WebGL)
-    if (this.isSoftwareGl || isVrPresenting) {
+    // Render Scene
+    if (!this.composer || isVrPresenting) {
       this.renderer.render(this.scene, this.camera);
     } else {
       this.composer.render();
     }
 
-    // Throttle HUD state pushes (~12 Hz)
-    if (now - this.lastHudEmit > 85) {
+    const hudInterval = isVrPresenting ? 300 : 90;
+    if (now - this.lastHudEmit > hudInterval) {
       this.emitHud(false);
     }
   };
@@ -1250,8 +1782,19 @@ export class SimulationController {
       plantType: this.params.plantType,
       plantedCount: this.plantedCount,
       chapterIndex: this.chapterIndex,
+      activePlateTitle: this.activePlateTitle,
+      activePlateAuthor: this.activePlateAuthor,
+      activePlateAccession: this.activePlateAccession,
+      season: this.params.season,
+      sunElevation: Number(this.params.sunElevation.toFixed(2)),
+      sunAzimuth: Number(this.params.sunAzimuth.toFixed(2)),
+      fogDensity: Number(this.params.fogDensity.toFixed(4)),
+      bloomStrength: Number(this.params.bloomStrength.toFixed(2)),
+      windStrength: Number(this.params.windStrength.toFixed(2)),
+      windDirection: Number(this.params.windDirection.toFixed(2)),
       interactionMode: this.params.interactionMode,
       interactionContext: this.params.interactionContext,
+      interactionRadius: Number(this.params.interactionRadius.toFixed(1)),
       activeSource: this.activeSource,
       secondaryCursorActive:
         this.handReading.active2 || (this.renderer.xr.isPresenting && this.webxrState.controllersConnected > 1),
@@ -1263,13 +1806,14 @@ export class SimulationController {
         y: Number(((this.smoothedNdcY + 1) * 0.5).toFixed(2)),
       },
       cursorSpeed: Number(this.lastCursorSpeed.toFixed(1)),
-      windStrength: Number(this.params.windStrength.toFixed(2)),
-      interactionRadius: Number(this.params.interactionRadius.toFixed(1)),
       handTracking: { ...this.handState },
       hardware: { ...this.hardwareState },
       playback: { ...this.playbackState },
       recording: { ...this.recordingState },
       webxr: { ...this.webxrState },
+      weather: { ...this.weatherState },
+      collab: { ...this.collabState, visitors: [...this.collabState.visitors] },
+      kiosk: { ...this.kioskState },
       webglLost: this.webglLost,
       isSoftwareGl: this.isSoftwareGl,
     });
@@ -1279,10 +1823,13 @@ export class SimulationController {
     this.disposed = true;
     this.renderer.setAnimationLoop(null);
     clearTimeout(this.frameId);
+    if (this.weatherTimer !== null) clearInterval(this.weatherTimer);
+    if (this.kioskTimer !== null) clearInterval(this.kioskTimer);
     this.unbindEvents();
 
     this.handTracker.dispose();
     this.hardware.dispose();
+    this.collab.disconnect(false);
     this.recorder.dispose();
     this.audio.dispose();
     this.webxr.dispose();
@@ -1293,7 +1840,7 @@ export class SimulationController {
     this.environment.dispose();
     this.forestMaterial.dispose();
     this.fluidFbo.dispose();
-    this.composer.dispose();
+    this.composer?.dispose();
     this.renderer.dispose();
 
     if (this.renderer.domElement.parentNode === this.mountEl) {
